@@ -464,8 +464,8 @@ $ bash scripts/dist.sh  # 一次产出 linux/darwin/windows 六个目标到 dist
 ## 测试
 
 ```
-$ go test ./... -count=1     # 单元测试(Linux 上实测 234 个:212 个 Test + 22 个 Benchmark,含 inotify/guard 的真内核用例;
-                             # 另有 4 个 //go:build !linux 的轮询后端用例,跨平台合计 238 个)
+$ go test ./... -count=1     # 单元测试(Linux 上实测 237 个:215 个 Test + 22 个 Benchmark,含 inotify/guard 的真内核用例;
+                             # 另有 4 个 //go:build !linux 的轮询后端用例,跨平台合计 241 个)
 $ bash scripts/e2e.sh         # 端到端:启动全量 → 改文件 → 新增 → 新建子目录 → 删目录 → 重命名 → 状态
 ```
 
@@ -479,7 +479,7 @@ $ bash scripts/e2e.sh         # 端到端:启动全量 → 改文件 → 新增 
 
 ```
 $ make build      # 本机二进制
-$ make test vet   # 212 个 Test + 22 个 Benchmark(Linux),外加 go vet 与 gofmt 检查
+$ make test vet   # 215 个 Test + 22 个 Benchmark(Linux),外加 go vet 与 gofmt 检查
 $ make e2e smoke  # 端到端 + 冒烟
 $ make dist       # 六个目标到 dist/
 ```

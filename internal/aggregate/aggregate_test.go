@@ -166,6 +166,52 @@ func TestOverflowEventSetsFlag(t *testing.T) {
 	}
 }
 
+// The pending tree must shrink back to nothing when the window drains. It is
+// pruned bottom-up, and a node that survives a drained window is a leak: on a
+// long-running daemon the tree would grow with every directory ever touched and
+// every later subtree walk would pay for it.
+func TestPendingTreePrunesBackToEmpty(t *testing.T) {
+	a := New(Options{})
+	at := time.Unix(0, 0)
+	a.Add(event.Event{Path: "/r/a/b/f", Op: event.Create, At: at})
+	a.Add(event.Event{Path: "/r/a/b/f", Op: event.Delete, At: at})
+	if items, _ := a.Flush(); len(items) != 0 {
+		t.Fatalf("want an empty window, got %+v", items)
+	}
+	if n := len(a.nodes); n != 0 {
+		for d, node := range a.nodes {
+			t.Logf("leftover node %q parent=%q children=%v", d, node.parent, node.children)
+		}
+		t.Fatalf("%d node(s) left in the pending tree after the window drained", n)
+	}
+}
+
+// The top of the tree is the path whose parent is itself, and linking it into
+// its own child list makes it impossible to prune: the node keeps pointing at
+// itself, so it survives every drain and any subtree walk below it recurses
+// until the stack runs out.
+func TestTopNodeIsNotItsOwnChild(t *testing.T) {
+	a := New(Options{})
+	a.Add(ev("/x/y", event.Write, false))
+	for dir, node := range a.nodes {
+		for _, child := range node.children {
+			if child == dir {
+				t.Fatalf("node %q lists itself as a child (parent=%q)", dir, node.parent)
+			}
+		}
+	}
+	// A subtree walk from the top must terminate and must find the entry.
+	found := false
+	for _, p := range a.subtreePaths(a.items[0].parent, nil) {
+		if p == "/x/y" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("subtree walk from the parent of a pending entry missed the entry")
+	}
+}
+
 // BenchmarkAdd measures the O(1) upsert path that replaced the O(n^2) scan.
 func BenchmarkAdd(b *testing.B) {
 	a := New(Options{MaxPending: 1 << 30})

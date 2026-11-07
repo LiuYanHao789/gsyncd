@@ -321,7 +321,7 @@ internal/event     统一事件模型(Op 位掩码)
 
 ### 6.4 已验证
 
-- `go vet ./...` 干净；`gofmt -l .` 为空；`go test ./...` 在真机（Linux）上 **234 个用例**全绿（212 个 Test + 22 个 Benchmark，按 `go test -list` 逐包统计；另有 4 个 `//go:build !linux` 用例，跨平台合计 238。逐包：cmd/gsyncd 8、aggregate 34+4、config 19、engine 41、filter 6+8、guard 7、logx 10+2、scanstate 7、status 4、sync 57+4、watcher 19+4）。规模用例：真机 `GSYNCD_AGGPATHS=1000000` 实测 100 万路径折叠 **235B/条常驻**（50 万条处是 243B/条，200 万条处 234B/条；耗时在 3,000–3,800ns/条之间波动，单次跑含 GC，机器间差异大）；`GSYNCD_AGGPATHS=20000000` 为 **215B/条、4173ns/条**；一次性删除 10 万文件集中到一个子树事件。
+- `go vet ./...` 干净；`gofmt -l .` 为空；`go test ./...` 在真机（Linux）上 **237 个用例**全绿（215 个 Test + 22 个 Benchmark，按 `go test -list` 逐包统计；另有 4 个 `//go:build !linux` 用例，跨平台合计 241。逐包：cmd/gsyncd 8、aggregate 36+4、config 19、engine 41、filter 6+8、guard 7、logx 10+2、scanstate 7、status 4、sync 58+4、watcher 19+4）。规模用例：真机 `GSYNCD_AGGPATHS=1000000` 实测 100 万路径折叠 **235B/条常驻**（50 万条处是 243B/条，200 万条处 234B/条；耗时在 3,000–3,800ns/条之间波动，单次跑含 GC，机器间差异大）；`GSYNCD_AGGPATHS=20000000` 为 **215B/条、4173ns/条**；一次性删除 10 万文件集中到一个子树事件。
 - Windows 上真实二进制端到端跑通（启动全量 → 改文件 → 新增 → 新建子目录 → 删目录 → 重命名 → `-status`），脚本见 `scripts/e2e.sh`（在 gsyncd 仓库内）。
 - 交叉编译全通过（静态、无 CGO，均 2.5–2.7MB）：linux/amd64、linux/arm64、linux/arm、darwin/amd64、darwin/arm64、windows/amd64；六个目标平台 `go vet` 均无输出。
 - 实测：20MiB 大文件跨 `fsync` 阈值同步后 `cmp` 一致；符号链接一律不镜像（避免把树外内容和环拷进来）；5 万文件首次全量 11.1s，对照 `cp -r` 35.7s。

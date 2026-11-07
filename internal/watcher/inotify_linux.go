@@ -301,9 +301,10 @@ func (b *inotifyBackend) dispatch(ev *rawEvent, name string) {
 	dir, ok := b.wdToDir[ev.Wd]
 	b.mu.RUnlock()
 	if !ok {
-		if ev.Mask&syscall.IN_IGNORED != 0 {
-			return
-		}
+		// No watch for this descriptor: it was removed above, or IN_IGNORED
+		// already retired it. Either way the event names nothing we can map
+		// back to a path, and guessing one would mirror a change onto the
+		// wrong file.
 		return
 	}
 	path := dir

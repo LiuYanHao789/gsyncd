@@ -333,28 +333,32 @@ func (a *Aggregator) appendItem(c Change) {
 }
 
 // ensureDir makes sure a node exists for dir and for every ancestor up to the
-// root of the pending tree. It stops as soon as it meets an existing node,
+// top of the pending tree. It stops as soon as it meets an existing node,
 // because an existing node already implies its whole chain.
+//
+// The top is the path whose parent is itself - "/" on Unix, "C:" and the
+// empty string on Windows - and it is deliberately not linked into anything.
+// parentOf returns the input for those, so linking would put the node into its
+// own child list; a self-referential node is never pruned, never counted and
+// turns any later subtree walk into an infinite recursion.
 func (a *Aggregator) ensureDir(dir string) {
-	for {
-		if _, ok := a.nodes[dir]; ok {
-			return
-		}
-		up := parentOf(dir)
-		n := &dirNode{parent: up}
-		a.nodes[dir] = n
-		if _, ok := a.nodes[up]; !ok && up == dir {
-			return
-		}
-		a.ensureDir(up)
-		pn := a.nodes[up]
-		if pn == nil {
-			return
-		}
-		n.slot = len(pn.children)
-		pn.children = append(pn.children, dir)
-		dir = up
+	if _, ok := a.nodes[dir]; ok {
+		return
 	}
+	up := parentOf(dir)
+	n := &dirNode{parent: up}
+	a.nodes[dir] = n
+	if up == dir {
+		n.parent = ""
+		return
+	}
+	a.ensureDir(up)
+	pn := a.nodes[up]
+	if pn == nil {
+		return
+	}
+	n.slot = len(pn.children)
+	pn.children = append(pn.children, dir)
 }
 
 func (a *Aggregator) applyMove(ev event.Event) {

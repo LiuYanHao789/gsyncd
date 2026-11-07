@@ -207,6 +207,42 @@ func TestPrefetchStopsAtBudget(t *testing.T) {
 	})
 }
 
+// TestPrefetcherCloseReleasesPool pins the lifetime fix: a walk used to leave
+// its workers blocked on an open channel forever, with the read-ahead they had
+// buffered still reachable through them. On an hourly full resync that is one
+// pool per hour for the lifetime of the daemon.
+func TestPrefetcherCloseReleasesPool(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "f"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := newPrefetcher(2, 8)
+	p.ready[root] = readDirEntries(root)
+	p.requested[root] = true
+	p.buffered = 1
+
+	p.Close()
+	p.Close() // must be idempotent
+
+	p.mu.Lock()
+	if p.ready != nil || p.requested != nil || p.buffered != 0 {
+		t.Fatalf("read-ahead survived Close: ready=%v requested=%v buffered=%d", p.ready, p.requested, p.buffered)
+	}
+	closed := p.closed
+	p.mu.Unlock()
+	if !closed {
+		t.Fatal("Close did not mark the pool closed")
+	}
+	if p.request(root) {
+		t.Fatal("request accepted after Close, but no worker will serve it")
+	}
+	// A closed pool must still answer: the caller reads the listing itself
+	// rather than blocking on a worker that has already returned.
+	if got := p.fetch(root); len(got) != 1 {
+		t.Fatalf("fetch after Close returned %d entries, want the inline read", len(got))
+	}
+}
+
 // waitFor polls a condition the dispatch goroutine sets, so the assertion does
 // not depend on how fast a scheduling decision lands.
 func waitFor(t *testing.T, cond func() bool) {

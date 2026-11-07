@@ -78,6 +78,16 @@ type dirResult struct {
 type prefetcher struct {
 	pending chan string
 	done    chan dirResult
+	// quit stops the pool. Without it every walk left its workers and its
+	// buffered listings reachable forever: the goroutines blocked on an
+	// open channel keep the maps alive, so a daemon that does an hourly full
+	// resync would accumulate one pool and its read-ahead per hour.
+	quit     chan struct{}
+	quitOnce sync.Once
+	// closed is set under mu once quit has been closed, so a caller that
+	// races with the close reads its own listing instead of queueing a
+	// request no worker will ever pick up.
+	closed bool
 
 	mu        sync.Mutex
 	requested map[string]bool
@@ -104,6 +114,7 @@ func newPrefetcher(workers, window int) *prefetcher {
 		requested: make(map[string]bool),
 		ready:     make(map[string][]dirEntry),
 		waiting:   make(map[string]chan []dirEntry),
+		quit:      make(chan struct{}),
 		window:    window,
 		budget:    prefetchEntryBudget,
 	}
@@ -115,9 +126,35 @@ func newPrefetcher(workers, window int) *prefetcher {
 }
 
 func (p *prefetcher) worker() {
-	for dir := range p.pending {
-		p.done <- dirResult{dir: dir, ents: readDirEntries(dir)}
+	for {
+		select {
+		case dir := <-p.pending:
+			res := dirResult{dir: dir, ents: readDirEntries(dir)}
+			select {
+			case p.done <- res:
+			case <-p.quit:
+				return
+			}
+		case <-p.quit:
+			return
+		}
 	}
+}
+
+// Close stops the pool. Listings still buffered are dropped: the driver is
+// finished with this tree, and keeping them reachable would defeat the point.
+func (p *prefetcher) Close() {
+	p.quitOnce.Do(func() {
+		p.mu.Lock()
+		p.closed = true
+		// Drop the read-ahead now rather than at collection time: a wide
+		// tree can be holding tens of megabytes in here.
+		p.ready = nil
+		p.requested = nil
+		p.buffered = 0
+		p.mu.Unlock()
+		close(p.quit)
+	})
 }
 
 // room reports whether another listing may be read speculatively without
@@ -130,13 +167,23 @@ func (p *prefetcher) room() bool {
 }
 
 func (p *prefetcher) dispatch() {
-	for r := range p.done {
+	for {
+		var r dirResult
+		select {
+		case r = <-p.done:
+		case <-p.quit:
+			return
+		}
 		p.mu.Lock()
 		if ch, ok := p.waiting[r.dir]; ok {
 			delete(p.waiting, r.dir)
 			delete(p.requested, r.dir)
 			p.mu.Unlock()
 			ch <- r.ents
+		} else if p.closed {
+			// Closing: nobody will ever ask for this listing.
+			p.mu.Unlock()
+			continue
 		} else {
 			p.ready[r.dir] = r.ents
 			p.buffered += len(r.ents)
@@ -169,6 +216,10 @@ func (p *prefetcher) dispatch() {
 // window, and any directory the pool did not take costs one inline read.
 func (p *prefetcher) request(dir string) bool {
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return false
+	}
 	if p.requested[dir] {
 		// Already asked for. Whoever asked will get it, but this caller needs
 		// its own answer, so it registers as a waiter instead.
@@ -184,6 +235,11 @@ func (p *prefetcher) request(dir string) bool {
 	select {
 	case p.pending <- dir:
 		return true
+	case <-p.quit:
+		p.mu.Lock()
+		delete(p.requested, dir)
+		p.mu.Unlock()
+		return false
 	default:
 		p.mu.Lock()
 		delete(p.requested, dir)
@@ -216,10 +272,25 @@ func (p *prefetcher) fetch(dir string) []dirEntry {
 		p.mu.Unlock()
 		return readDirEntries(dir)
 	}
+	// A fresh timer rather than time.After: this path runs once per
+	// directory, and time.After leaves its timer registered for the full
+	// timeout even when the listing arrives immediately, which on a 210k
+	// directory tree is a lot of timer churn for nothing.
+	timer := time.NewTimer(prefetchFetchTimeout)
+	defer timer.Stop()
 	select {
 	case ents := <-ch:
 		return ents
-	case <-time.After(prefetchFetchTimeout):
+	case <-p.quit:
+		// Closed while waiting. Read it here for the same reason as the
+		// timeout path: returning an empty listing would look like an empty
+		// directory and make the prune delete the target it stands for.
+		p.mu.Lock()
+		delete(p.waiting, dir)
+		delete(p.requested, dir)
+		p.mu.Unlock()
+		return readDirEntries(dir)
+	case <-timer.C:
 		// Only reachable if a worker died or a request was lost. Read inline
 		// rather than stall the sync.
 		p.mu.Lock()
@@ -288,6 +359,7 @@ func walkOrdered(ctx context.Context, root string, workers, window int, fn func(
 		return fn(root, nil, err)
 	}
 	p := newPrefetcher(workers, window)
+	defer p.Close()
 
 	var walk func(rel, abs string, info os.FileInfo) error
 	walk = func(rel, abs string, info os.FileInfo) error {

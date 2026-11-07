@@ -2,7 +2,6 @@ package watcher
 
 import (
 	"os"
-	"strings"
 )
 
 // The watch table is a flat map from directory path to its slot in the parent's
@@ -225,5 +224,3 @@ func (t *Tree) OrphanCount() int {
 	}
 	return n
 }
-
-var _ = strings.TrimSuffix

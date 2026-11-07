@@ -520,8 +520,8 @@ func relPath(root, p string) string {
 	rel = strings.TrimPrefix(rel, string(filepath.Separator))
 	rel = strings.TrimPrefix(rel, "/")
 	// Exclude patterns are written with '/' and matched segment by segment.
-	// On Windows the watcher hands out '' separated paths, which matched
-	// nothing at all: every exclude silently stopped working there.
+	// On Windows the watcher hands out paths separated by backslashes, which
+	// matched nothing at all: every exclude silently stopped working there.
 	return filepath.ToSlash(rel)
 }
 
