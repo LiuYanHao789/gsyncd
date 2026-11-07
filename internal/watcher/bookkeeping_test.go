@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -206,8 +205,6 @@ func TestDropPathToleratesStaleSlot(t *testing.T) {
 	}
 	tree.mu.Unlock()
 }
-
-var _ = filepath.Join
 
 // TestMemoryPerDirectory measures the user-space cost of one tracked directory.
 // It is the number that decides whether a 100T tree (millions of directories)

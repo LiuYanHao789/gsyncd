@@ -71,10 +71,13 @@ func TestCheckpointSecondRunCopiesNothing(t *testing.T) {
 		t.Fatalf("second run copied %d files, want 0", got)
 	}
 	line := second.find("scan state:")
-	if !strings.Contains(line, "0 directories verified") && strings.Contains(line, "0 reused") {
-		t.Fatalf("second run reused nothing: %q", line)
+	if line == "" {
+		t.Fatal("the second run did not report its scan state")
 	}
-	if strings.Contains(line, "0 reused") {
+	// "reused" is the number of files whose directory digest still matched, so
+	// on an unchanged tree every one of them must have hit. A zero here means
+	// the checkpoint was read but never trusted.
+	if strings.Contains(line, " 0 reused") {
 		t.Fatalf("second run reused nothing: %q", line)
 	}
 	// The mirror is still correct.

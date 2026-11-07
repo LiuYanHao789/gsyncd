@@ -12,7 +12,7 @@ import (
 
 func benchCtx(tb testing.TB) context.Context { return context.Background() }
 
-// buildBenchTree creates fan^depth directories, each holding files regular
+// buildBenchTree creates fan^depth directories, each holding 'files' regular
 // files of size bytes. Depth 0 is a single leaf directory.
 func buildBenchTree(tb testing.TB, root string, fan, depth, files, size int) int {
 	tb.Helper()

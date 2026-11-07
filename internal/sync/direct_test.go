@@ -42,8 +42,6 @@ func TestDirectStartupMirrors(t *testing.T) {
 	}
 }
 
-// Excluded paths must be absent from the initial copy as well, not just from
-// the incremental event stream.
 // A source root that does not exist must fail the sync instead of reporting
 // success over an untouched target, and it must never be mistaken for an empty
 // tree - that would let pruneDir wipe the whole mirror when a filesystem is not
@@ -82,6 +80,8 @@ func TestFullBatchRefusesMissingSourceRoot(t *testing.T) {
 	}
 }
 
+// Excluded paths must be absent from the initial copy as well, not just from
+// the incremental event stream.
 func TestDirectStartupHonoursIgnore(t *testing.T) {
 	src, dst := t.TempDir(), t.TempDir()
 	write(t, filepath.Join(src, "keep.txt"), "k")
@@ -241,7 +241,7 @@ func TestDirectApplyNoTempLeftovers(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, e := range entries {
-		if len(e.Name()) > 12 && e.Name()[:12] == ".gsyncd-tmp-" {
+		if strings.HasPrefix(e.Name(), ".gsyncd-tmp-") {
 			t.Fatalf("temporary file left behind: %s", e.Name())
 		}
 	}
