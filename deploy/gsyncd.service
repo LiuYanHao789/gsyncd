@@ -1,0 +1,71 @@
+[Unit]
+Description=gsyncd - real-time directory mirror (single static binary)
+# 文档没有随二进制安装（README 不落 /usr/share/doc），所以这里不写 Documentation=。
+# 想让它出现在 systemctl status 里，就自己把 README 放到一个固定路径再取消注释：
+# Documentation=file:/usr/local/share/doc/gsyncd/README.md
+# rsyncssh 模式才需要 network-online；纯本机 direct 模式可删掉这两行。
+After=network-online.target
+Wants=network-online.target
+
+# 可选：如果后端挂的是独立数据盘，等它挂好再启动，否则会对着空挂载点
+# 做一次 "delete = true" 的启动同步，把目标端清空。
+# RequiresMountsFor=/srv/data /backup/data
+
+[Service]
+Type=simple
+# -nodaemon 必须有：gsyncd 默认会 fork+setsid 自我脱离，那样 systemd 会认为
+# 主进程已退出（unit 显示 active，实际守护进程在别处，stop 也停不掉）。
+ExecStart=/usr/local/bin/gsyncd -config /etc/gsyncd/gsyncd.toml -nodaemon
+# ExecStartPre 做配置自检：配置写错时立刻失败，而不是起一个空转的 unit。
+ExecStartPre=/usr/local/bin/gsyncd -config /etc/gsyncd/gsyncd.toml -check
+
+# 收到 SIGTERM 后 gsyncd 会停止接收新事件、把在飞的批次做完（内部最多等 30s）。
+# TimeoutStopSec 必须大于这个值，否则正在写的大文件会被 systemd 直接 SIGKILL，
+# 目标端留下 .gsyncd-tmp-* 残片。残片不会被下次同步自动覆盖：只有在下次遍历到
+# 该目标目录、且残片已存在超过 24 小时时才会被清掉（gsyncd/internal/sync/direct.go 的
+# tmpMaxAge 与 sweepTemp），在此之前一直占着空间。
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+# 非零退出才重启。注意：配置错误也会非零退出，这时会陷入
+# "10 秒一次、永远失败" 的循环 —— 部署后请用
+#   systemctl status gsyncd && journalctl -u gsyncd -n 50
+# 确认它确实起来了，而不是在崩。
+Restart=on-failure
+RestartSec=10
+
+# 状态文件 / 检查点 / 日志的落点。StateDirectory 让 systemd 负责创建
+# /var/lib/gsyncd 并把它交给本服务（比 tmpfiles.d 更省事）。
+# 注意它只管这一个目录：pid_file 若配在 /run 下，要么改成 /var/lib/gsyncd/gsyncd.pid，
+# 要么另加 RuntimeDirectory=gsyncd 让 systemd 管 /run/gsyncd。
+# 日志写到 /var/log/gsyncd 时同样需要自己建目录（deploy/gsyncd.tmpfiles.conf 里那行）。
+StateDirectory=gsyncd
+StateDirectoryMode=0750
+
+# 打开文件数。direct 后端每批最多 16 个并发拷贝，每个占 2~3 个 fd，
+# 加上 inotify 与日志，正常远低于 1024；这里放宽是为了应对未来并发调大。
+LimitNOFILE=1048576
+
+# 不建议给 gsyncd 负的 OOMScoreAdjust。它看起来「保护同步进程」，代价却是
+# 内存紧张时被牺牲的是同机业务进程 —— 而这个工具的价值恰恰是不打扰业务。
+# 内存该由配置里的 memory_limit（Go 运行时的软上限，超过就积极 GC 而不是死）
+# 来管；真需要一个硬墙就用 cgroup 的 memory 控制器：
+#
+#   MemoryLimit=2G          # 旧名，systemd < 231 用这个（Anolis/CentOS 7 是 219）
+#   MemoryMax=2G            # systemd >= 231（231 起 MemoryLimit 只剩已废弃的别名）
+#
+# 硬墙和 memory_limit 的分工：memory_limit 让 Go 提前回收、几乎不会被墙撞到；
+# cgroup 是最后一道，撞上就是 OOM kill —— 重启后从 checkpoint 续扫，已拷完的目录不再重传。
+# OOMScoreAdjust=0          # 保持默认，不做特殊保护
+
+# --- 加固（默认注释掉：下面这套要求显式列出所有可写路径）---
+# NoNewPrivileges=true
+# PrivateTmp=true
+# ProtectSystem=strict
+# ProtectHome=true
+# ReadWritePaths=/srv/data /backup/data /var/lib/gsyncd
+# 注意：一旦启用 ProtectSystem=strict，任何没列进 ReadWritePaths 的目标路径
+# 都会变成只读，直接同步失败。加一个 sync 就要记得加一条路径。
+
+[Install]
+WantedBy=multi-user.target

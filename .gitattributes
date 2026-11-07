@@ -1,0 +1,13 @@
+# Line endings are normalised on the way in so a checkout on Windows behaves
+# like one on Linux; the broad rule comes first because later rules win.
+* text=auto eol=lf
+*.sh text eol=lf
+*.go text eol=lf
+*.md text eol=lf
+
+# Release binaries are checked in so a clone is immediately runnable; keep git
+# from trying to diff or text-convert them. These must stay below the rules
+# above: the last matching pattern wins, so a trailing "* text=auto" would
+# undo the "binary" attribute here.
+dist/gsyncd-* binary
+dist/SHA256SUMS text eol=lf

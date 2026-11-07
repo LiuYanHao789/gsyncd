@@ -1,0 +1,8 @@
+# Local build output (dist/ is committed on purpose: those are the release
+# binaries, and keeping them in the tree means a checkout is immediately usable)
+/gsyncd
+/gsyncd.exe
+
+# Scratch trees created by scripts/e2e.sh and scripts/smoke.sh
+/.e2e/
+/.gsyncd-smoke/
