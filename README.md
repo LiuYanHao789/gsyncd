@@ -455,7 +455,7 @@ journalctl -u gsyncd -f
 ## 构建
 
 ```
-$ CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o gsyncd ./cmd/gsyncd
+$ CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags "-s -w" -o gsyncd ./cmd/gsyncd
 $ bash scripts/dist.sh  # 一次产出 linux/darwin/windows 六个目标到 dist/,附 SHA256SUMS
 ```
 

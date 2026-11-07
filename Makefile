@@ -9,7 +9,7 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 all: build
 
 build:
-	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN) ./cmd/gsyncd
+	CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags "$(LDFLAGS)" -o $(BIN) ./cmd/gsyncd
 
 test:
 	go test ./... -count=1

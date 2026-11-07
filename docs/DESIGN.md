@@ -865,6 +865,8 @@ $ bash scripts/smoke.sh ./dist/gsyncd-linux-amd64   # 目标机冒烟
 
 交叉编译（CGO 关闭，静态）：linux/amd64、linux/arm64、linux/arm、darwin/amd64、darwin/arm64、windows/amd64 全部通过，体积 2.5–2.7MB。产物落在 `dist/`，由 `bash scripts/dist.sh` 一次生成并附 `SHA256SUMS`（避免隐藏目录里的产物在交付时找不到）。
 
+构建命令带 `-buildvcs=false`：Go 1.18 起工具链会把 VCS 版本信息戳进二进制，那样同一个 tag 在两次构建（或从 tarball 构建）里得到的字节不同，`dist/SHA256SUMS` 就成了「只对当时那次构建成立」的校验值。版本号本来就由 `-X main.version` 注入，关掉 VCS 戳之后 `CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags "-s -w -X main.version=0.1.22"` 在任何一台装了 Go 1.23 的机器上都会得到与 `dist/gsyncd-linux-amd64` 逐字节相同的文件（实测过：从 `git clone` 出来的干净副本构建，sha256 一致）。
+
 发布二进制本身在真机上验过三件事，不只是「编译通过」：`file` 显示 `statically linked`、`ldd` 报「不是动态可执行文件」、以 `nobody` 身份执行 `-version` 同样正常 —— 也就是说把它复制到任何同架构 Linux 上就能跑，不需要 Lua、不需要 rsync 的运行时库、不需要目标机上装 Go。竞态用 `CGO_ENABLED=1 go test -race ./internal/... -count=1` 在 8 核实机上跑过一遍（十一个包全绿，`grep -c 'DATA RACE'` 为 0）：并发点集中在 watcher 的子节点索引、聚合器的窗口、引擎的 retry gate 与 status 快照，这些地方单靠 `go test` 只能证明「没崩」，证明不了「没有同时读写同一张表」。
 
 测试能通过不等于测试有约束力，所以关键不变量还做了一次**变异检验**：把 `aggregate.go` 里 `removeAt` 的 `a.openFiles--` 删掉，`TestOpenCountStaysConsistent` 在第 7 步就报 `openFiles=1 but 0 entries carry the flag`；把 `upsertKnown` 里「重命名带过来的 open 标志」那三行去掉，`TestRenameOntoPendingPathStaysOpen` 立刻失败。两处改回后全绿 —— 也就是说这两条用例不是摆设，它们真的守着 `close_write` 唯一的判据。这类「计数器与窗口内容不一致」的缺陷不会崩、不会报错，只会让窗口要么提前放行（拷半截）要么永远不放行（等 `max_hold`），所以必须靠不变量而不是靠读代码来保证。

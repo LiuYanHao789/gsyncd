@@ -37,8 +37,12 @@ build() {
   # printf would treat a format starting with '-' as an option, so prefix it
   # with a literal that cannot be confused for one.
   printf '%s %-8s %-6s %s\n' '-->' "$1" "$2" "$3"
+  # -buildvcs=false: since Go 1.18 the toolchain stamps the VCS revision into
+  # the binary. That would make every release depend on the commit it was built
+  # from, so the same tag built twice (or from a tarball) would not match the
+  # published SHA256SUMS. The version is already stamped via -X main.version.
   CGO_ENABLED=0 GOOS="$1" GOARCH="$2" GOARM="${4:-}" \
-    go build -trimpath -ldflags "$LDFLAGS" -o "$NOUT/$3" ./cmd/gsyncd
+    go build -buildvcs=false -trimpath -ldflags "$LDFLAGS" -o "$NOUT/$3" ./cmd/gsyncd
 }
 
 build linux   amd64 gsyncd-linux-amd64
