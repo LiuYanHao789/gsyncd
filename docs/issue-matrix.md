@@ -109,7 +109,7 @@
 | 328 | issue | Crash with long paths in printlogf0() from l_addwatch() | 日志用 Go 字符串，无固定长度缓冲，长路径不会越界。 |
 | 336 | issue | default-rsyncssh -- can't move files | move 走 rename 快路径，失败才回退拷贝+删除；有 TestDirectRename / TestRenameFallbackCopyHonoursIgnore。 |
 | 340 | issue | Rsync scan all the directory when the is only one change | 只把变更路径交给 rsync(--files-from=-)，不会扫全树。 |
-| 343 | issue | Mac OS X 10.5 - Overflow in event queue | IN_Q_OVERFLOW → Overflow 事件 → Batch{Full：true}，进程不重启、不退出。 |
+| 343 | issue | Mac OS X 10.5 - Overflow in event queue | IN_Q_OVERFLOW → Overflow 事件 → Batch{Full:true}，进程不重启、不退出。 |
 | 348 | issue | direct mode allows injecting unauthorized filesystem operations | direct 模式对每个路径做 relInside 校验，拒绝越界路径（TestDirectRejectsPathsOutsideSource）。 |
 | 350 | issue | lsyncd crashes when it cannot change source directory (Segmentation fault) | 错误一律返回并记日志，不崩。 |
 | 351 | issue | Timestamps to logfiles | logx 每行带时间戳与级别。 |
