@@ -108,10 +108,3 @@ func TestBurstDeleteOfHundredThousand(t *testing.T) {
 		t.Fatalf("expected at least %d collapsed events, got %d", n, st.Collapsed)
 	}
 }
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}

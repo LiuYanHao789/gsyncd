@@ -94,7 +94,10 @@ func BenchmarkMatchMiss(b *testing.B) {
 	}
 }
 
-func BenchmarkMatchCached(b *testing.B) {
+// BenchmarkMatchRepeatedPath is the one case a per-path cache would have won:
+// the same path asked over and over. It is kept to record why that did not
+// matter - a real tree asks about nearly every path exactly once.
+func BenchmarkMatchRepeatedPath(b *testing.B) {
 	f := New([]string{"*.log", "*.tmp", "/cache/"})
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

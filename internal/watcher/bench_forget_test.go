@@ -52,12 +52,13 @@ func BenchmarkLeafDelete(b *testing.B) {
 	}
 }
 
-// BenchmarkMassDeleteTree removes a whole 10k directory tree one event at a
-// time, the way the kernel reports an rm -rf.
+// BenchmarkMassDeleteTree deletes a whole tree one event at a time, the way the
+// kernel reports an rm -rf: ten top level directories, a hundred below them and
+// a thousand leaves, so 1110 deletions.
 func BenchmarkMassDeleteTree(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		tree, _ := buildTree(b, 10, 10, 2) // 1000 directories
+		tree, _ := buildTree(b, 10, 10, 2) // 1110 directories
 		all := make([]string, 0, len(tree.dirs))
 		for p := range tree.dirs {
 			all = append(all, p)

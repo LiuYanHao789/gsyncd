@@ -126,7 +126,7 @@ sync.Backend.Apply(Batch) ── 进程闸(semaphore)+ 失败退避 + readd 重�
 | 100,000 | 1.54 ms | 148 ns |
 | 1,000,000 | **44.1 ms** | **229 ns** |
 
-（`BenchmarkLeafDelete`，本机 benchtime 2000x；`BenchmarkMassDeleteTree` 1000 个目录整棵删除：7.92 ms → 294 µs。）
+（`BenchmarkLeafDelete`，本机 benchtime 2000x；`BenchmarkMassDeleteTree` 1110 个目录整棵删除：7.92 ms → 294 µs。）
 
 按修前的数字外推，100 万目录的一次 `rm -rf` 要在 watcher 里烧掉**约 12 小时 CPU**，而这段时间它腾不出手去排空内核队列 —— 溢出、全量重扫、重启循环，这就是 issue #695「批量操作时卡死」的真实成因，和聚合层那个 58 秒是同一个病的两个病灶。
 
