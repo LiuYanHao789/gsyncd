@@ -34,7 +34,16 @@ jobs:
         with:
           go-version: "1.23"
       - name: Cross-compile
-        run: VERSION="${GITHUB_REF_NAME#v}" bash scripts/dist.sh
+        # A tag push carries the release version (v0.1.22 -> 0.1.22); a branch
+        # push does not, and the tag-stripping expansion would stamp the branch
+        # name ("main") into the binaries, so leave VERSION empty there and let
+        # dist.sh fall back to its own default.
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) VERSION="${GITHUB_REF_NAME#v}" ;;
+            *)            VERSION="" ;;
+          esac
+          VERSION="$VERSION" bash scripts/dist.sh
       - uses: actions/upload-artifact@v4
         with:
           name: gsyncd-binaries
