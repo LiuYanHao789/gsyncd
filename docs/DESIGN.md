@@ -866,7 +866,7 @@ $ bash scripts/smoke.sh ./dist/gsyncd-linux-amd64   # 目标机冒烟
 
 交叉编译（CGO 关闭，静态）：linux/amd64、linux/arm64、linux/arm、darwin/amd64、darwin/arm64、windows/amd64 全部通过，体积 2.5–2.7MB。产物落在 `dist/`，由 `bash scripts/dist.sh` 一次生成并附 `SHA256SUMS`（避免隐藏目录里的产物在交付时找不到）。
 
-构建命令带 `-buildvcs=false`：Go 1.18 起工具链会把 VCS 版本信息戳进二进制，同一个 tag 从 `git clone` 构建与从 tarball 构建会得到不同的字节，`dist/SHA256SUMS` 就成了「只对当时那次构建成立」的校验值。版本号本来就由 `-X main.version` 注入，关掉 VCS 戳之后构建结果只取决于源码与工具链版本：从 `git clone` 出来的干净副本用 Go 1.23.4 构建，得到与 `dist/gsyncd-linux-amd64` 逐字节相同的文件（sha256 `a9d8cceb…`）。换用 Go 1.23.9 构建同一份源码则得到不同字节（`76a15aee…`）—— Go 不保证跨工具链版本的二进制可复现，所以「按 SHA256SUMS 校验下载」这件事在同一个 Go 版本、同一套 flags 下才能重现。
+构建命令带 `-buildvcs=false`：Go 1.18 起工具链会把 VCS 版本信息戳进二进制，同一个 tag 从 `git clone` 构建与从 tarball 构建会得到不同的字节，`dist/SHA256SUMS` 就成了「只对当时那次构建成立」的校验值。版本号本来就由 `-X main.version` 注入，关掉 VCS 戳之后构建结果只取决于源码与工具链版本：从 `git clone` 出来的干净副本用 Go 1.23.4 构建，得到与 `dist/gsyncd-linux-amd64` 逐字节相同的文件（sha256 `c64a69c7…`，与 `dist/SHA256SUMS` 同一行）。换用真机上的 Go 1.23.9 构建同一份源码则得到不同字节（sha256 `9bc073b9…`，文件大小相同但内容不同）—— Go 不保证跨工具链版本的二进制可复现，所以「按 SHA256SUMS 校验下载」这件事在同一个 Go 版本、同一套 flags 下才能重现。
 
 发布二进制本身在真机上验过三件事，不只是「编译通过」：`file` 显示 `statically linked`、`ldd` 报「不是动态可执行文件」、以 `nobody` 身份执行 `-version` 同样正常 —— 也就是说把它复制到任何同架构 Linux 上就能跑，不需要 Lua、不需要 rsync 的运行时库、不需要目标机上装 Go。竞态用 `CGO_ENABLED=1 go test -race ./internal/... -count=1` 在 8 核实机上跑过一遍（十一个包全绿，`grep -c 'DATA RACE'` 为 0）：并发点集中在 watcher 的子节点索引、聚合器的窗口、引擎的 retry gate 与 status 快照，这些地方单靠 `go test` 只能证明「没崩」，证明不了「没有同时读写同一张表」。
 
