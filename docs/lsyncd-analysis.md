@@ -323,7 +323,7 @@ internal/event     统一事件模型(Op 位掩码)
 
 - `go vet ./...` 干净；`gofmt -l .` 为空；`go test ./...` 在真机（Linux）上 **237 个用例**全绿（215 个 Test + 22 个 Benchmark，按 `go test -list` 逐包统计；另有 4 个 `//go:build !linux` 用例，跨平台合计 241。逐包：cmd/gsyncd 8、aggregate 36+4、config 19、engine 41、filter 6+8、guard 7、logx 10+2、scanstate 7、status 4、sync 58+4、watcher 19+4）。规模用例：真机 `GSYNCD_AGGPATHS=1000000` 实测 100 万路径折叠 **235B/条常驻**（50 万条处是 243B/条，200 万条处 234B/条；耗时在 3,000–3,800ns/条之间波动，单次跑含 GC，机器间差异大）；`GSYNCD_AGGPATHS=20000000` 为 **215B/条、4173ns/条**；一次性删除 10 万文件集中到一个子树事件。
 - Windows 上真实二进制端到端跑通（启动全量 → 改文件 → 新增 → 新建子目录 → 删目录 → 重命名 → `-status`），脚本见 `scripts/e2e.sh`（在 gsyncd 仓库内）。
-- 交叉编译全通过（静态、无 CGO，均 2.5–2.7MB）：linux/amd64、linux/arm64、linux/arm、darwin/amd64、darwin/arm64、windows/amd64；六个目标平台 `go vet` 均无输出。
+- 交叉编译全通过（静态、无 CGO，均 2.7–2.9MB）：linux/amd64、linux/arm64、linux/arm、darwin/amd64、darwin/arm64、windows/amd64；六个目标平台 `go vet` 均无输出。
 - 实测：20MiB 大文件跨 `fsync` 阈值同步后 `cmp` 一致；符号链接一律不镜像（避免把树外内容和环拷进来）；5 万文件首次全量 11.1s，对照 `cp -r` 35.7s。
 - **真机压测**（Anolis 7.9 / kernel 4.19 / 8 核 / 62G / XFS）：12 万文件初始全量 8s；2 万文件 burst 18s 收敛、删 20 棵子树 7s、重命名目录 8s、2000 个等长改写 6s，差异全部为 0；**51 万文件 / 51 万目录**装 watch 10s、初始全量 1m18s–2m21s（取决于 `workers`，见下）、RSS 142–193MB；后端轮换测量则显示 2–4 个 worker 即平台期（1.3–1.7 万 changes/s），1 个 worker 慢 1.6–2.0 倍。详见 `gsyncd/docs/DESIGN.md` 的 §3.3 与 §6.1。
 - 同一棵 51 万目录的树交替对照 `cp -a`：**两种相反顺序下 `cp -a` 都快 10%–25%**（101.5s/95.2s 对 132.1s/121.3s），而在 10 万文件量级上结论相反（gsyncd 快 26%–55%）。gsyncd 的定位是常驻镜像服务而不是一次性拷贝器，首次全量的绝对速度是它最不重要的属性。

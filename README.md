@@ -61,7 +61,7 @@ gsyncd/
 ├── deploy/                systemd unit、tmpfiles.d、sysctl 调优
 ├── examples/              带注释的完整配置模板
 ├── scripts/               dist.sh(交叉编译)、e2e.sh(端到端)、smoke.sh(目标机冒烟)
-├── docs/                  DESIGN.md(设计与取舍)、lsyncd-analysis.md(原版逐行精读)、issue-matrix.md(733 条 issue 逐条回归)
+├── docs/                  DESIGN.md(设计与取舍)、lsyncd-analysis.md(原版逐行精读)、issue-matrix.md(733 条 issue 与 PR 逐条回归)
 ├── dist/                  交叉编译产物 + SHA256SUMS(由 scripts/dist.sh 生成)
 ├── Makefile               build / test / vet / e2e / smoke / dist / clean
 ├── go.mod                 仅 module 与 go 版本,无任何第三方依赖
@@ -459,7 +459,7 @@ $ CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags "-s -w" -o gsyncd ./
 $ bash scripts/dist.sh  # 一次产出 linux/darwin/windows 六个目标到 dist/,附 SHA256SUMS
 ```
 
-产物是静态链接的单文件（linux-amd64 约 2.7MB），可直接扔进 scratch / distroless 镜像。
+产物是静态链接的单文件（linux-amd64 约 2.8MB），可直接扔进 scratch / distroless 镜像。
 
 ## 测试
 

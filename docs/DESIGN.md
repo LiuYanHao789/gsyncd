@@ -1,7 +1,7 @@
 # gsyncd 设计说明
 
 本文说明三件事：**为什么要重写**、**新架构怎么分层**、**每一条已知缺陷/瓶颈在新实现里怎么被消掉**。
-对原版的逐行精读见 [`docs/lsyncd-analysis.md`](lsyncd-analysis.md)（lsyncd 2.3.1 全仓库 18090 行的逐行阅读记录、缺陷清单与规模瓶颈分析）。上游 733 条 issue 的逐条判定见 [`docs/issue-matrix.md`](issue-matrix.md)。
+对原版的逐行精读见 [`docs/lsyncd-analysis.md`](lsyncd-analysis.md)（lsyncd 2.3.1 全仓库 18090 行的逐行阅读记录、缺陷清单与规模瓶颈分析）。上游 733 条 issue 与 PR 的逐条判定见 [`docs/issue-matrix.md`](issue-matrix.md)。
 
 ---
 
@@ -864,7 +864,7 @@ $ bash scripts/smoke.sh ./dist/gsyncd-linux-amd64   # 目标机冒烟
 
 `scripts/e2e.sh` 覆盖的不只是「文件同步过去了」：它逐层断言排除规则（启动拷贝、运行期事件、目标端从未出现）、删除、以及**重命名一个目录**后目标端的新旧名字与整棵子树。这三处正是原版最容易静默出错的地方（§3.2 的 issue #225 / 排除规则一致性），所以做成硬断言而非日志观察。
 
-交叉编译（CGO 关闭，静态）：linux/amd64、linux/arm64、linux/arm、darwin/amd64、darwin/arm64、windows/amd64 全部通过，体积 2.5–2.7MB。产物落在 `dist/`，由 `bash scripts/dist.sh` 一次生成并附 `SHA256SUMS`（避免隐藏目录里的产物在交付时找不到）。
+交叉编译（CGO 关闭，静态）：linux/amd64、linux/arm64、linux/arm、darwin/amd64、darwin/arm64、windows/amd64 全部通过，体积 2.7–2.9MB。产物落在 `dist/`，由 `bash scripts/dist.sh` 一次生成并附 `SHA256SUMS`（避免隐藏目录里的产物在交付时找不到）。
 
 构建命令带 `-buildvcs=false`：Go 1.18 起工具链会把 VCS 版本信息戳进二进制，同一个 tag 从 `git clone` 构建与从 tarball 构建会得到不同的字节，`dist/SHA256SUMS` 就成了「只对当时那次构建成立」的校验值。版本号本来就由 `-X main.version` 注入，关掉 VCS 戳之后构建结果只取决于源码与工具链版本：从 `git clone` 出来的干净副本用 Go 1.23.4 构建，得到与 `dist/gsyncd-linux-amd64` 逐字节相同的文件（sha256 `c64a69c7…`，与 `dist/SHA256SUMS` 同一行）。换用真机上的 Go 1.23.9 构建同一份源码则得到不同字节（sha256 `9bc073b9…`，文件大小相同但内容不同）—— Go 不保证跨工具链版本的二进制可复现，所以「按 SHA256SUMS 校验下载」这件事在同一个 Go 版本、同一套 flags 下才能重现。
 
