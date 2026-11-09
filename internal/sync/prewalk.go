@@ -32,6 +32,7 @@ import (
 	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -174,6 +175,21 @@ func (p *prefetcher) dispatch() {
 		case <-p.quit:
 			return
 		}
+		// Fan out one level before handing r.ents to its owner. The receiver
+		// sorts the slice in place; reading it after the send would race with
+		// that sort. The budget check stops the fan-out on a wide tree:
+		// without it every listing read spawns requests for all of its
+		// subdirectories, each of which will be read and then sit in ready
+		// until the driver walks into it.
+		for _, e := range r.ents {
+			if !e.info.IsDir() {
+				continue
+			}
+			if !p.room() {
+				break
+			}
+			p.request(filepath.Join(r.dir, e.name))
+		}
 		p.mu.Lock()
 		if ch, ok := p.waiting[r.dir]; ok {
 			delete(p.waiting, r.dir)
@@ -188,21 +204,6 @@ func (p *prefetcher) dispatch() {
 			p.ready[r.dir] = r.ents
 			p.buffered += len(r.ents)
 			p.mu.Unlock()
-		}
-		// Fan out one level. A chain of single-child directories gains nothing
-		// here, but each child is exactly what the driver asks for next, so it
-		// is worth requesting. The budget check stops the fan-out on a wide
-		// tree: without it every listing read spawns requests for all of its
-		// subdirectories, each of which will be read and then sit in ready
-		// until the driver walks into it.
-		for _, e := range r.ents {
-			if !e.info.IsDir() {
-				continue
-			}
-			if !p.room() {
-				break
-			}
-			p.request(filepath.Join(r.dir, e.name))
 		}
 	}
 }
@@ -301,23 +302,84 @@ func (p *prefetcher) fetch(dir string) []dirEntry {
 	}
 }
 
+// parallelStatThreshold is the directory size above which the per-entry stat
+// calls are spread over workers. Below it the pool overhead is larger than the
+// work; above it one prefetch worker would otherwise stat a hundred thousand
+// entries on a single thread while every other worker waits.
+const parallelStatThreshold = 4096
+
+// statLimit bounds concurrent nested stat calls across all prefetch workers.
+// Prefetch itself is already parallel across directories; without this bound a
+// burst of large directories would multiply that by the per-directory worker
+// count and flood the disk with concurrent metadata requests.
+var statLimit = make(chan struct{}, statWorkers())
+
+func statWorkers() int {
+	n := runtime.NumCPU()
+	if n < 4 {
+		n = 4
+	}
+	if n > 32 {
+		n = 32
+	}
+	return n
+}
+
 func readDirEntries(dir string) []dirEntry {
-	des, err := os.ReadDir(dir)
+	des, err := readDirFast(dir)
 	if err != nil {
 		// A directory that cannot be read is treated as empty, which is what
 		// the serial walk did: it called the walk function with the error and
 		// the callback chose to ignore it. The watcher reports the change.
 		return nil
 	}
-	out := make([]dirEntry, 0, len(des))
-	for _, de := range des {
-		info, err := de.Info()
-		if err != nil {
-			continue
+	out := make([]dirEntry, len(des))
+	if len(des) < parallelStatThreshold {
+		n := 0
+		for _, de := range des {
+			info, err := de.Info()
+			if err != nil {
+				continue
+			}
+			out[n] = dirEntry{name: de.Name(), info: info}
+			n++
 		}
-		out = append(out, dirEntry{name: de.Name(), info: info})
+		return out[:n]
 	}
-	return out
+
+	workers := statWorkers()
+	if workers > len(des) {
+		workers = len(des)
+	}
+	var next int64
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(atomic.AddInt64(&next, 1)) - 1
+				if i >= len(des) {
+					return
+				}
+				statLimit <- struct{}{}
+				info, err := des[i].Info()
+				<-statLimit
+				if err == nil {
+					out[i] = dirEntry{name: des[i].Name(), info: info}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	n := 0
+	for i := range out {
+		if out[i].info != nil {
+			out[n] = out[i]
+			n++
+		}
+	}
+	return out[:n]
 }
 
 // prefetchWorkers is the number of listing readers to use for a walk.

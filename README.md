@@ -123,7 +123,8 @@ nice 值是**逐个线程**设的（`setpriority` 在 Linux 上只影响调用�
 | `status_file` | string | `""` | JSON 状态文件，原子替换写入 |
 | `status_interval` | duration | `10s` | 状态刷新间隔 |
 | `max_processes` | int | `8` | 全局并发传输闸（跨所有 sync 共享） |
-| `max_pending` | int | `500000` | 单个 sync 的聚合窗口上限；达到上限立即提前发送（不丢事件，也不触发全量） |
+| `max_pending` | int | `500000` | 单个 sync 的聚合窗口软上限；达到上限立即提前发送（不丢事件，也不触发全量） |
+| `max_pending_hard` | int | `2000000` | 聚合窗口硬上限；超过后丢弃新事件并标记 overflow，由全量重同步恢复。用于防止慢目标+事件洪峰把内存拖到 OOM |
 | `watch_interval` | duration | `30s` | 非 Linux 平台的轮询间隔（Linux 走 inotify，忽略此项） |
 | `full_resync` | duration | `0` | 周期性全量重同步间隔。`0` 不是「关闭」：所有目录都装上 watch 时不做周期全量，有目录装不上时自动改成每小时一次。写明确值则一律按它跑 |
 | `nodaemon` | bool | `false` | 前台运行。由 systemd 等托管时**必须**打开 |

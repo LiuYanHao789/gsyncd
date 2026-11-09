@@ -243,16 +243,17 @@ func run() error {
 			return fmt.Errorf("sync %q: %w", s.Name, err)
 		}
 		specs = append(specs, engine.Spec{
-			Name:         s.Name,
-			Source:       s.Source,
-			Delay:        s.Delay,
-			Filter:       flt,
-			Backend:      be,
-			MaxPending:   cfg.Global.MaxPending,
-			MaxHold:      maxHold(s.MaxHold),
-			Retries:      3,
-			MaxProcesses: s.MaxProcesses,
-			CloseWrite:   s.CloseWrite,
+			Name:           s.Name,
+			Source:         s.Source,
+			Delay:          s.Delay,
+			Filter:         flt,
+			Backend:        be,
+			MaxPending:     cfg.Global.MaxPending,
+			MaxPendingHard: cfg.Global.MaxPendingHard,
+			MaxHold:        maxHold(s.MaxHold),
+			Retries:        3,
+			MaxProcesses:   s.MaxProcesses,
+			CloseWrite:     s.CloseWrite,
 		})
 		logger.Infof("[%s] mode=%s %s -> %s delay=%s delete=%v close_write=%v",
 			s.Name, s.Mode, s.Source, s.Target, s.Delay, s.Delete, s.CloseWrite)

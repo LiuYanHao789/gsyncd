@@ -341,6 +341,11 @@ func (r *RSync) Apply(ctx context.Context, b Batch) error {
 	}
 
 	uploads, deletes := r.plan(b.Changes)
+	// Exit 23 means some paths could not be read or transferred. It is not
+	// fatal to the invocation (the rest of the batch did land), but the batch
+	// must be reported so the engine re-adds those paths: silently treating it
+	// as delivered leaves them missing until a full resync.
+	var partial error
 
 	if len(uploads) > 0 {
 		limit := r.BatchLimit
@@ -353,9 +358,14 @@ func (r *RSync) Apply(ctx context.Context, b Batch) error {
 				end = len(uploads)
 			}
 			err := r.upload(ctx, uploads[start:end])
-			if err != nil && !r.benignExit(err) {
-				atomic.AddUint64(&r.st.Errors, 1)
-				return err
+			if err != nil {
+				if !r.benignExit(err) {
+					atomic.AddUint64(&r.st.Errors, 1)
+					return err
+				}
+				if ExitCode(err) == 23 && partial == nil {
+					partial = err
+				}
 			}
 			// A partial transfer still moved the paths that survived, so they
 			// are counted: the counter is "what reached the target", and
@@ -367,11 +377,13 @@ func (r *RSync) Apply(ctx context.Context, b Batch) error {
 		if r.DeleteOnRun {
 			if err := r.deleteList(ctx, deletes); err != nil {
 				if r.benignExit(err) {
-					atomic.AddUint64(&r.st.Deletes, uint64(len(deletes)))
-					return nil
+					if ExitCode(err) == 23 && partial == nil {
+						partial = err
+					}
+				} else {
+					atomic.AddUint64(&r.st.Errors, 1)
+					return err
 				}
-				atomic.AddUint64(&r.st.Errors, 1)
-				return err
 			}
 			atomic.AddUint64(&r.st.Deletes, uint64(len(deletes)))
 		} else if !r.dropWarned {
@@ -382,6 +394,9 @@ func (r *RSync) Apply(ctx context.Context, b Batch) error {
 			r.dropWarned = true
 			r.Logf("info", "%d runtime deletion(s) not mirrored: delete = \"startup\" reconciles only during the initial sync", len(deletes))
 		}
+	}
+	if partial != nil {
+		return partial
 	}
 	return nil
 }

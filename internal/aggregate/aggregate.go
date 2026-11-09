@@ -67,9 +67,15 @@ type Stats struct {
 
 // Options configures an Aggregator.
 type Options struct {
-	// MaxPending is the soft cap. When exceeded, the aggregator reports
-	// Overflow instead of growing without bound.
+	// MaxPending is the soft cap. When exceeded, the aggregator asks for an
+	// immediate flush but keeps accepting events.
 	MaxPending int
+	// MaxPendingHard is the true ceiling. Past it new events are dropped and
+	// the window is marked overflowed, which schedules a full resync. That is
+	// the safe direction: memory stays bounded, and the lost events are
+	// recovered by the resync rather than by growing until the process is
+	// killed.
+	MaxPendingHard int
 	// Now allows tests to control the clock.
 	Now func() time.Time
 }
@@ -134,6 +140,12 @@ type Aggregator struct {
 func New(opts Options) *Aggregator {
 	if opts.MaxPending <= 0 {
 		opts.MaxPending = 500_000
+	}
+	if opts.MaxPendingHard <= 0 {
+		opts.MaxPendingHard = opts.MaxPending * 4
+	}
+	if opts.MaxPendingHard < opts.MaxPending {
+		opts.MaxPendingHard = opts.MaxPending
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now
@@ -309,6 +321,15 @@ func (a *Aggregator) setOpen(i int, open bool) {
 
 // appendItem adds a brand new entry and links it into the directory tree.
 func (a *Aggregator) appendItem(c Change) {
+	if a.pending >= a.opts.MaxPendingHard {
+		// The window is already at its hard ceiling. Keeping this event would
+		// trade bounded memory for an OOM kill; an overflow event makes the
+		// engine re-synchronise the whole root, which recovers it.
+		a.overflow = true
+		a.urgent = true
+		a.stats.Dropped++
+		return
+	}
 	c.parent = parentOf(c.Path)
 	a.ensureDir(c.parent)
 	node := a.nodes[c.parent]

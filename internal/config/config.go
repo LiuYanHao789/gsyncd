@@ -44,6 +44,9 @@ type Global struct {
 	MaxProcesses int
 	// MaxPending caps the aggregated change window per sync.
 	MaxPending int
+	// MaxPendingHard is the point past which events are dropped and a full
+	// resync is scheduled instead of growing memory without bound.
+	MaxPendingHard int
 	// WatchInterval selects the polling backend when > 0 on any platform.
 	WatchInterval time.Duration
 	// FullResync is the interval of a periodic wholesale resync. It is the
@@ -201,6 +204,7 @@ func Default() Config {
 			StatusInterval: 10 * time.Second,
 			MaxProcesses:   8,
 			MaxPending:     500_000,
+			MaxPendingHard: 2_000_000,
 			TargetGuard:    true,
 		},
 	}
@@ -319,7 +323,7 @@ func isGlobalKey(k string) bool {
 	switch normKey(k) {
 	case "logfile", "loglevel", "logmaxsize", "logmaxfiles", "pidfile",
 		"statusfile", "statusinterval", "nodaemon", "maxprocesses",
-		"maxpending", "watchinterval", "fullresync", "memorylimit", "nice", "ioprio", "targetguard":
+		"maxpending", "maxpendinghard", "watchinterval", "fullresync", "memorylimit", "nice", "ioprio", "targetguard":
 		return true
 	}
 	return false
@@ -348,6 +352,8 @@ func applyGlobal(g *Global, t tomlTable) error {
 			g.MaxProcesses = int(asInt64(v))
 		case "maxpending":
 			g.MaxPending = int(asInt64(v))
+		case "maxpendinghard":
+			g.MaxPendingHard = int(asInt64(v))
 		case "watchinterval":
 			g.WatchInterval = seconds(v)
 		case "fullresync":

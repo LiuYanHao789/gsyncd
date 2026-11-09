@@ -36,6 +36,9 @@ type Spec struct {
 	Backend syncpkg.Backend
 	// MaxPending caps the aggregation window; 0 means the global default.
 	MaxPending int
+	// MaxPendingHard drops events and schedules a full resync past this
+	// ceiling; 0 means a multiple of MaxPending.
+	MaxPendingHard int
 	// MaxHold bounds how long a pending change may wait for the tree to fall
 	// silent, which is what a delay normally means - but a file that is
 	// written to continuously (a log, a WAL, a database growing in place)
@@ -264,7 +267,7 @@ func New(specs []Spec, opts Options) (*Engine, error) {
 		if s.MaxProcesses > 0 {
 			r.limit = make(chan struct{}, s.MaxProcesses)
 		}
-		r.agg = aggregate.New(aggregate.Options{MaxPending: s.MaxPending, Now: opts.Now})
+		r.agg = aggregate.New(aggregate.Options{MaxPending: s.MaxPending, MaxPendingHard: s.MaxPendingHard, Now: opts.Now})
 		e.roots = append(e.roots, r)
 	}
 	// Longest source first so lookup() finds the most specific root by

@@ -109,3 +109,29 @@ func TestApplyKeepsExit1Fatal(t *testing.T) {
 		t.Fatalf("Errors = %d, want 1", r.Stats().Errors)
 	}
 }
+
+// Exit 23 means some paths were not transferred. The batch must be reported so
+// the engine re-adds it; swallowing it leaves those paths missing until a full
+// resync.
+func TestApplyReportsExit23ForRetry(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("needs a POSIX shell to fake an rsync exit status")
+	}
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "rsync")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 23\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GSYNCD_RSYNC", fake)
+	r := NewRSync(dir, filepath.Join(dir, "dst"), true, nil, nil)
+	r.Timeout = 30 * time.Second
+	err := r.Apply(context.Background(), Batch{Changes: []aggregate.Change{
+		{Path: filepath.Join(dir, "a.txt"), Op: event.Write | event.Create},
+	}})
+	if err == nil {
+		t.Fatal("Apply swallowed exit 23; the batch would never be retried")
+	}
+	if got := ExitCode(err); got != 23 {
+		t.Fatalf("ExitCode(err) = %d, want 23", got)
+	}
+}

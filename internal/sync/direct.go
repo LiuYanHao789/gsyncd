@@ -477,7 +477,7 @@ func writeSymlink(dst, text string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	f, err := os.CreateTemp(dir, tmpPrefix+"link-*")
+	f, err := createTemp(dir, tmpPrefix+"link-*")
 	if err != nil {
 		return err
 	}
@@ -582,6 +582,12 @@ func (d *Direct) walkCopy(ctx context.Context) error {
 	if _, err := os.Stat(d.Source); err != nil {
 		return fmt.Errorf("source root is not usable, refusing to sync: %w", err)
 	}
+	// A full target must stop the pass, not be hammered with every remaining
+	// file. The cancellation is internal to this walk; the caller's context is
+	// untouched.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var noSpace int64
 	// Without a checkpoint the walk behaves exactly as it did before: no
 	// frames, no digests, no per-directory bookkeeping.
 	tracking := d.scan != nil
@@ -597,6 +603,13 @@ func (d *Direct) walkCopy(ctx context.Context) error {
 		if err == nil {
 			return
 		}
+		if isNoSpace(err) {
+			if atomic.AddInt64(&noSpace, 1) >= 16 {
+				cancel()
+			}
+		} else {
+			atomic.StoreInt64(&noSpace, 0)
+		}
 		errMu.Lock()
 		if firstErr == nil {
 			firstErr = err
@@ -609,6 +622,14 @@ func (d *Direct) walkCopy(ctx context.Context) error {
 		go func() {
 			defer wg.Done()
 			for it := range ch {
+				select {
+				case <-ctx.Done():
+					if it.pd != nil {
+						it.pd.fileDone(true)
+					}
+					continue
+				default:
+				}
 				err := d.copyFileAt(ctx, it.rel, it.info)
 				if err != nil {
 					d.Logf("debug", "copy %s: %v", it.rel, err)
@@ -890,10 +911,10 @@ func (d *Direct) walkCopy(ctx context.Context) error {
 		d.Logf("info", "scan state: %d directories verified, %d reused, %d recorded, %d dropped",
 			checked, hits, emitted, dropped)
 	}
-	if walkErr != nil {
-		return walkErr
+	if firstErr != nil {
+		return firstErr
 	}
-	return firstErr
+	return walkErr
 }
 
 // targetIsEmpty reports whether dir holds no entries at all.
@@ -1098,7 +1119,7 @@ func copyFile(src, dst string, info os.FileInfo, fsyncAll, verify bool, retries 
 }
 
 func copyFileOnce(src, dst string, info os.FileInfo, fsyncAll, verify bool, logf func(string, string, ...any)) error {
-	in, err := os.Open(src)
+	in, err := openRead(src)
 	if err != nil {
 		return err
 	}
@@ -1110,7 +1131,7 @@ func copyFileOnce(src, dst string, info os.FileInfo, fsyncAll, verify bool, logf
 	}
 
 	dir := filepath.Dir(dst)
-	tmp, err := os.CreateTemp(dir, tmpPrefix+"*")
+	tmp, err := createTemp(dir, tmpPrefix+"*")
 	if err != nil {
 		return err
 	}
@@ -1184,7 +1205,7 @@ func copyFileOnce(src, dst string, info os.FileInfo, fsyncAll, verify bool, logf
 // that verifies what readers of this mount will see, not necessarily the
 // server's stable storage.
 func verifyStaged(path string, size int64, want hash.Hash) error {
-	f, err := os.Open(path)
+	f, err := openRead(path)
 	if err != nil {
 		return err
 	}
@@ -1236,6 +1257,11 @@ func (d *Direct) Apply(ctx context.Context, b Batch) error {
 		}
 		return renames[i].From < renames[j].From
 	})
+	// A full target stops the batch after a few failures instead of trying
+	// every remaining change.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var noSpace int64
 	// Every failure has to reach the caller, not just the first one that fits
 	// in a buffered channel. A batch that reports success while some of its
 	// files were never written leaves the mirror silently wrong until the next
@@ -1246,6 +1272,13 @@ func (d *Direct) Apply(ctx context.Context, b Batch) error {
 	note := func(err error) {
 		if err == nil {
 			return
+		}
+		if isNoSpace(err) {
+			if atomic.AddInt64(&noSpace, 1) >= 16 {
+				cancel()
+			}
+		} else {
+			atomic.StoreInt64(&noSpace, 0)
 		}
 		atomic.AddUint64(&d.st.Errors, 1)
 		errMu.Lock()
@@ -1329,9 +1362,14 @@ func (d *Direct) Apply(ctx context.Context, b Batch) error {
 	wg.Wait()
 	if skipped > 0 {
 		d.Logf("warn", "%d changes not applied: %v", skipped, ctx.Err())
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	if skipped > 0 {
 		return ctx.Err()
 	}
-	return firstErr
+	return nil
 }
 
 // relInside resolves a change path against the source and refuses anything

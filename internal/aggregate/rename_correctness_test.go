@@ -101,3 +101,22 @@ func TestDirDeleteRecreateMarksRecreate(t *testing.T) {
 		t.Fatalf("recreated directory missing: %+v", items)
 	}
 }
+
+// Past the hard ceiling the window drops events and reports overflow; keeping
+// them would trade bounded memory for an OOM kill, and the full resync that
+// overflow schedules recovers them.
+func TestHardCapDropsAndOverflows(t *testing.T) {
+	a := New(Options{MaxPending: 10, MaxPendingHard: 20})
+	for i := 0; i < 100; i++ {
+		a.Add(event.Event{Path: "/p/" + string(rune('a'+i%26)) + string(rune('0'+i/26)), Op: event.Create, At: at()})
+	}
+	if n := a.Len(); n != 20 {
+		t.Fatalf("window grew to %d, want hard cap 20", n)
+	}
+	if !a.Overflowed() {
+		t.Fatal("dropping past the hard cap must mark overflow")
+	}
+	if a.Stats().Dropped == 0 {
+		t.Fatal("dropped events were not counted")
+	}
+}
