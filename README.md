@@ -84,7 +84,7 @@ gsyncd/
 | `-check` | 校验配置（含源目录、目标守卫）后退出 |
 | `-init-target` | 向每个本地目标写入 `.gsyncd-target` marker 后退出；目标必须已存在（用于目标守卫的首次初始化） |
 | `-verify-tree` | 只读对比源与目标的目录树和文件集合（目标端只 readdir），有差异时退出码非 0 |
-| `-verify-content` | 只读对比源与目标所有（或抽样）文件的 SHA-256，有差异时退出码非 0；代价是完整读一遍两侧 |
+| `-verify-content` | 对比源与目标所有（或抽样）文件的 SHA-256、大小、mtime，有差异时退出码非 0；代价是完整读一遍两侧。会在目标写一个临时探测文件判断时间戳精度，随后删除 |
 | `-verify-sample N` | 配合 `-verify-content`：按路径确定性抽取 N% 文件；0 或 100 表示全部 |
 | `-verify-workers N` | 配合 `-verify-content`：并发哈希数；0 表示 `min(CPU,16)` |
 | `-watch-interval D` | 可移植轮询后端的扫描间隔（如 `30s`） |
@@ -354,6 +354,7 @@ scan state: 1000001 directories verified, 1000001 reused, 0 recorded, 0 dropped
 - **目录树完整性**：`gsyncd -config ... -verify-tree`；目标端只 `readdir`，按目录比对名字/类型，报告缺失、多余、类型不一致。适合首传/全量后每天跑一次。
 - **内容深校验**：`gsyncd -config ... -verify-content`（可配 `-verify-sample N`、`-verify-workers N`）。两侧都完整读一遍；1TB 本地盘约数十分钟到数小时，100TB 级是数天到数周，默认不自动跑，建议用 cron/systemd timer 低频执行。
 - **读回缓存说明**：默认模式验证的是“通过该挂载点读到的内容”；同一 NFS 客户端的缓存可能让读回不落到服务端磁盘。需要更强保证时，把目标挂载为 `sync` 或在维护窗口直接对服务端做校验。
+- **时间戳精度**：启动和 `-verify-content` 时会用一个临时文件探测目标文件系统的 mtime 精度（秒/毫秒/微秒/纳秒），比较时按该精度截断。128 字节 inode 的 ext4、FAT、部分 NFSv3 导出只能存整秒，否则每个文件都会被误判为“已改变”并反复重拷。探测前后会恢复目标目录的 mtime，不影响 checkpoint。
 - `rsync`/`rsyncssh` 后端依赖 rsync 自身的滚动块校验；`-verify-tree`/`-verify-content` 对本地/NFS 挂载目标同样适用，对纯 ssh 远端需要目标端可达。
 
 ## 从 lsyncd 迁移
