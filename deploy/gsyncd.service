@@ -36,13 +36,14 @@ TimeoutStopSec=90
 Restart=on-failure
 RestartSec=10
 
-# 状态文件 / 检查点 / 日志的落点。StateDirectory 让 systemd 负责创建
-# /var/lib/gsyncd 并把它交给本服务（比 tmpfiles.d 更省事）。
-# 注意它只管这一个目录：pid_file 若配在 /run 下，要么改成 /var/lib/gsyncd/gsyncd.pid，
-# 要么另加 RuntimeDirectory=gsyncd 让 systemd 管 /run/gsyncd。
-# 日志写到 /var/log/gsyncd 时同样需要自己建目录（deploy/gsyncd.tmpfiles.conf 里那行）。
-StateDirectory=gsyncd
-StateDirectoryMode=0750
+# 状态文件 / 检查点 / 日志的落点。
+# StateDirectory=/StateDirectoryMode= 是 systemd 235+ 才支持的指令；
+# Anolis/CentOS 7 的 systemd 219 会报 "Unknown lvalue" 并且不会创建目录。
+# 因此这里不写它们，改由 ExecStartPre 和 deploy/gsyncd.tmpfiles.conf 负责：
+#   install -d /var/lib/gsyncd /var/log/gsyncd
+# 安装 tmpfiles 配置后也可以执行 systemd-tmpfiles --create。
+# pid_file 若配在 /run 下，请自行创建 /run/gsyncd 或改到 /var/lib/gsyncd。
+ExecStartPre=/usr/bin/install -d -m 0750 /var/lib/gsyncd /var/log/gsyncd
 
 # 打开文件数。direct 后端每批最多 16 个并发拷贝，每个占 2~3 个 fd，
 # 加上 inotify 与日志，正常远低于 1024；这里放宽是为了应对未来并发调大。
