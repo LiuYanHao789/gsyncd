@@ -187,6 +187,43 @@ func TestStartupWithVerifyCopiesContent(t *testing.T) {
 	}
 }
 
+func TestApplyRefusesTargetMovedAtRuntime(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	write(t, filepath.Join(src, "a"), "v1")
+	if err := InitTarget(dst); err != nil {
+		t.Fatal(err)
+	}
+	d := NewDirect(src, dst, true, 1, nil)
+	d.TargetGuard = true
+	if err := d.Startup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	away := dst + "-away"
+	if err := os.Rename(dst, away); err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(src, "a"), "v2")
+	b := Batch{Changes: []aggregate.Change{{Path: filepath.Join(src, "a"), Op: event.Write}}}
+	if err := d.Apply(context.Background(), b); err == nil {
+		t.Fatal("Apply wrote after the target directory moved away")
+	}
+	if _, err := os.Stat(dst); !os.IsNotExist(err) {
+		t.Fatalf("Apply recreated the missing target: %v", err)
+	}
+	// Restoring the same directory (same device/inode) is recognised as the
+	// target verified at startup, so the retry converges.
+	if err := os.Rename(away, dst); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Apply(context.Background(), b); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(dst, "a"))
+	if err != nil || string(body) != "v2" {
+		t.Fatalf("recovered copy = %q, %v", body, err)
+	}
+}
+
 func TestTargetGuardRequiresMarkerOrMount(t *testing.T) {
 	dir := t.TempDir()
 	if mounted, err := onNonRootMount(dir); err == nil && mounted {

@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -51,6 +52,9 @@ type RSync struct {
 	// is on a real mount or carries the marker. It is skipped for rsyncssh,
 	// where Target names a host rather than a path.
 	TargetGuard bool
+	// targetInfo is the identity captured at Startup; Apply re-checks it so a
+	// target moved or replaced at runtime is not recreated and filled.
+	targetInfo os.FileInfo
 	// Excludes are rsync style patterns. They are forwarded to rsync as
 	// --exclude/--include so that the initial whole-tree transfer honours them
 	// too: filtering only the event stream would leave every excluded file
@@ -240,6 +244,11 @@ func (r *RSync) Startup(ctx context.Context) error {
 		if err := CheckTarget(r.Target); err != nil {
 			return err
 		}
+		st, err := os.Stat(r.Target)
+		if err != nil {
+			return err
+		}
+		r.targetInfo = st
 	}
 	src := strings.TrimSuffix(r.Source, string(filepath.Separator)) + string(filepath.Separator)
 	args := r.baseArgs()
@@ -313,6 +322,15 @@ func (r *RSync) Apply(ctx context.Context, b Batch) error {
 	}
 	if len(b.Changes) == 0 {
 		return nil
+	}
+	if r.TargetGuard && !r.SSH && !strings.Contains(r.Target, ":") && r.targetInfo != nil {
+		st, err := os.Stat(r.Target)
+		if err != nil {
+			return fmt.Errorf("target %s disappeared while running, refusing to write: %w", r.Target, err)
+		}
+		if !os.SameFile(r.targetInfo, st) {
+			return fmt.Errorf("target %s is no longer the filesystem verified at startup, refusing to write", r.Target)
+		}
 	}
 	atomic.AddUint64(&r.st.Batches, 1)
 

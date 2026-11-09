@@ -64,6 +64,11 @@ type Direct struct {
 	Verify bool
 	// VerifyRetries is how many extra copy attempts a mismatch gets.
 	VerifyRetries int
+	// targetInfo is the identity of the target directory captured by Startup.
+	// Before every batch it is compared with the current path: a target that
+	// was moved, unmounted or replaced while the daemon ran must not silently
+	// turn into a new directory that gsyncd then fills.
+	targetInfo os.FileInfo
 	// Logf receives diagnostics.
 	Logf func(level string, format string, args ...any)
 
@@ -164,6 +169,13 @@ func (d *Direct) Startup(ctx context.Context) error {
 		}
 	} else if err := os.MkdirAll(d.Target, 0o755); err != nil {
 		return err
+	}
+	if d.TargetGuard {
+		st, err := os.Stat(d.Target)
+		if err != nil {
+			return err
+		}
+		d.targetInfo = st
 	}
 	d.pruned = 0
 	d.freshTarget = targetIsEmpty(d.Target)
@@ -1229,6 +1241,20 @@ func (d *Direct) Apply(ctx context.Context, b Batch) error {
 	}
 	if len(b.Changes) == 0 {
 		return nil
+	}
+	// The target was verified by Startup. Re-check its identity before a
+	// batch: if the path disappeared (a moved mount, an unmounted disk whose
+	// mount point is now an ordinary directory) writing would recreate it and
+	// fill whatever is underneath. os.SameFile compares device and inode, so a
+	// remount or replacement is caught without reading mountinfo per batch.
+	if d.TargetGuard && d.targetInfo != nil {
+		st, err := os.Stat(d.Target)
+		if err != nil {
+			return fmt.Errorf("target %s disappeared while running, refusing to write: %w", d.Target, err)
+		}
+		if !os.SameFile(d.targetInfo, st) {
+			return fmt.Errorf("target %s is no longer the filesystem verified at startup, refusing to write", d.Target)
+		}
 	}
 
 	// Renames first: they are cheap and free the old name before a possible
