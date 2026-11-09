@@ -36,14 +36,13 @@ TimeoutStopSec=90
 Restart=on-failure
 RestartSec=10
 
-# 状态文件 / 检查点 / 日志的落点。
-# StateDirectory=/StateDirectoryMode= 是 systemd 235+ 才支持的指令；
-# Anolis/CentOS 7 的 systemd 219 会报 "Unknown lvalue" 并且不会创建目录。
-# 因此这里不写它们，改由 ExecStartPre 和 deploy/gsyncd.tmpfiles.conf 负责：
-#   install -d /var/lib/gsyncd /var/log/gsyncd
-# 安装 tmpfiles 配置后也可以执行 systemd-tmpfiles --create。
-# pid_file 若配在 /run 下，请自行创建 /run/gsyncd 或改到 /var/lib/gsyncd。
-ExecStartPre=/usr/bin/install -d -m 0750 /var/lib/gsyncd /var/log/gsyncd
+# 状态文件 / 检查点 / 日志 / pid 的路径完全由 TOML 决定，本 unit 不设置目录：
+#   [global] log_file / status_file / pid_file
+#   [[sync]] checkpoint
+# gsyncd 会自动创建 log/status/pid 的父目录；显式 checkpoint 的父目录需已存在，
+# 或用 checkpoint = "auto"。
+# StateDirectory=/StateDirectoryMode= 是 systemd 235+ 指令，systemd 219
+# （Anolis/CentOS 7）会报 Unknown lvalue，因此这里不使用。
 
 # 打开文件数。direct 后端每批最多 16 个并发拷贝，每个占 2~3 个 fd，
 # 加上 inotify 与日志，正常远低于 1024；这里放宽是为了应对未来并发调大。
