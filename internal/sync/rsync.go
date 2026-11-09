@@ -47,6 +47,10 @@ type RSync struct {
 	DeleteOnRun bool
 	// BatchLimit splits large windows into several invocations.
 	BatchLimit int
+	// TargetGuard refuses to write unless a local target already exists and
+	// is on a real mount or carries the marker. It is skipped for rsyncssh,
+	// where Target names a host rather than a path.
+	TargetGuard bool
 	// Excludes are rsync style patterns. They are forwarded to rsync as
 	// --exclude/--include so that the initial whole-tree transfer honours them
 	// too: filtering only the event stream would leave every excluded file
@@ -135,6 +139,9 @@ func (r *RSync) baseArgs() []string {
 	// whose children are represented only by that single path) would arrive
 	// empty. The original lsyncd passed -r here as well.
 	args := []string{"-a", "-r", "--from0", "--files-from=-"}
+	// --safe-links makes rsync ignore symlinks whose target escapes the copied
+	// tree, matching the direct backend's "internal links only" rule.
+	args = append(args, "--safe-links", "--exclude="+TargetMarkerName)
 	// Keep the transfer restartable after an interruption: a 100 TB tree must
 	// not begin again from zero because one batch failed.
 	args = append(args, "--partial", "--partial-dir=.rsync-partial")
@@ -229,6 +236,11 @@ func (r *RSync) dest() string {
 
 // Startup performs the initial transfer of the whole tree.
 func (r *RSync) Startup(ctx context.Context) error {
+	if r.TargetGuard && !r.SSH && !strings.Contains(r.Target, ":") {
+		if err := CheckTarget(r.Target); err != nil {
+			return err
+		}
+	}
 	src := strings.TrimSuffix(r.Source, string(filepath.Separator)) + string(filepath.Separator)
 	args := r.baseArgs()
 	// A startup run must mirror the tree, so it does not use --files-from.
@@ -303,6 +315,30 @@ func (r *RSync) Apply(ctx context.Context, b Batch) error {
 		return nil
 	}
 	atomic.AddUint64(&r.st.Batches, 1)
+
+	// A directory deleted and recreated in one window must lose its old target
+	// contents before the new contents are uploaded. rsync's incremental path
+	// has no --delete, so that removal is explicit and happens first.
+	if r.DeleteOnRun {
+		for _, c := range b.Changes {
+			if !c.Recreate {
+				continue
+			}
+			rel, ok := relInSource(r.Source, c.Path)
+			if !ok {
+				continue
+			}
+			if r.SSH {
+				if err := r.deleteList(ctx, []string{c.Path}); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := os.RemoveAll(filepath.Join(r.Target, rel)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+	}
 
 	uploads, deletes := r.plan(b.Changes)
 

@@ -142,19 +142,27 @@ func TestRenameRetargetsPendingDelete(t *testing.T) {
 	}
 }
 
-// A pending create below a renamed directory is already covered by the rename:
-// keeping it would ask the engine to process a path that no longer exists.
-func TestRenameDropsPendingCreates(t *testing.T) {
+// A pending write below a renamed directory is not carried by the target
+// rename: the target only moves the copy it already has. It has to follow the
+// directory to its new name, or the write is lost.
+func TestRenameRetargetsPendingWrites(t *testing.T) {
 	a := New(Options{})
 	a.Add(ev("/r/old/a.txt", event.Write, false))
 	a.Add(event.Event{Path: "/r/new", From: "/r/old", Op: event.Move, IsDir: true})
 
 	items, _ := a.Flush()
-	if len(items) != 1 {
-		t.Fatalf("want only the rename, got %+v", items)
+	paths := map[string]event.Op{}
+	for _, c := range items {
+		paths[c.Path] = c.Op
 	}
-	if items[0].Path != "/r/new" || items[0].Kind != KindDir {
-		t.Fatalf("want dir rename, got %+v", items[0])
+	if op, ok := paths["/r/new/a.txt"]; !ok || op&event.Write == 0 {
+		t.Fatalf("pending write was not retargeted: %+v", items)
+	}
+	if _, ok := paths["/r/old/a.txt"]; ok {
+		t.Fatalf("stale path survived rename: %+v", items)
+	}
+	if op, ok := paths["/r/new"]; !ok || op&event.Move == 0 {
+		t.Fatalf("want dir rename, got %+v", items)
 	}
 }
 

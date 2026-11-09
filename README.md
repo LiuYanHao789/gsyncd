@@ -81,7 +81,8 @@ gsyncd/
 | `-nodaemon` | 前台运行（日志默认写 stderr） |
 | `-once` | 只做初始全量同步，完成后退出 |
 | `-status PATH` | 打印状态文件并退出 |
-| `-check` | 校验配置（含源目录存在性）后退出 |
+| `-check` | 校验配置（含源目录、目标守卫）后退出 |
+| `-init-target` | 向每个本地目标写入 `.gsyncd-target` marker 后退出；目标必须已存在（用于目标守卫的首次初始化） |
 | `-watch-interval D` | 可移植轮询后端的扫描间隔（如 `30s`） |
 | `-full-resync D` | 周期性全量重同步间隔；`-1`（默认）表示沿用配置，不覆盖 |
 | `-version` | 打印版本 |
@@ -125,6 +126,7 @@ nice 值是**逐个线程**设的（`setpriority` 在 Linux 上只影响调用�
 | `nice` | int | `0`（不动） | CPU 调度优先级，-20（最优）…19（最差）。设为 10 让 gsyncd 排在同机 java/mysql/redis 之后 |
 | `io_prio` | string | `""`（不动） | IO 调度类：`idle` \| `best-effort` \| `realtime`，可带级别如 `best-effort:7`。`idle` 让内核先把磁盘带宽给别人 |
 | `memory_limit` | int \| string | `0`（不设） | 内存软上限，支持 `k`/`m`/`g`/`t` 后缀（如 `"1g"`）。交给 Go 运行时的 `debug.SetMemoryLimit`：接近上限时更积极地 GC 并把空闲页还给内核 |
+| `target_guard` | bool | `true` | 写目标前的安全守卫：目标必须已存在，且位于非 `/` 的挂载点上，或带有 `.gsyncd-target` marker；否则拒绝启动。用于阻止目标盘未挂载时把镜像写进本地根分区。首次挂载后运行 `gsyncd -config ... -init-target` 写入 marker；目标在 NFS/独立盘挂载点下时通常无需 marker |
 
 ### `[[sync]]`
 
@@ -214,7 +216,7 @@ duration 接受 `15`（=15s）、`"500ms"`、`"2m"`、`"1h30m"`；键名同时�
 
 | mode | 需要什么 | 行为 |
 |---|---|---|
-| `direct`（默认） | 无 | 进程内拷贝：写 `.gsyncd-tmp-*` → `fsync` → `rename`；删除多余项；不跟随符号链接 |
+| `direct`（默认） | 无 | 进程内拷贝：写 `.gsyncd-tmp-*` → `fsync` → `rename`；删除多余项；符号链接只在指向同步根内部时保留，外部链接跳过并记日志；FIFO/socket/设备节点跳过 |
 | `rsync` | `rsync` | 变更列表通过 `--files-from=- --from0` 从 stdin 传入（不受 `ARG_MAX` 限制） |
 | `rsyncssh` | `rsync` + `ssh` | 同上，目标为 `host:path`，附带 `-e ssh` 参数 |
 
@@ -379,6 +381,8 @@ install -m 0755 dist/gsyncd-linux-amd64 /usr/local/bin/gsyncd
 install -d /etc/gsyncd
 install -m 0600 examples/gsyncd.example.toml /etc/gsyncd/gsyncd.toml
 $EDITOR /etc/gsyncd/gsyncd.toml          # 改 source / target / excludes
+# 目标盘必须已经挂载；marker 写在目标文件系统里，卸载后会随之消失。
+/usr/local/bin/gsyncd -config /etc/gsyncd/gsyncd.toml -init-target
 /usr/local/bin/gsyncd -config /etc/gsyncd/gsyncd.toml -check
 
 # 3. 内核参数(同步 10T 时建议全部启用,详见文件内注释)

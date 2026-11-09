@@ -72,6 +72,9 @@ TOML
 sed "s|@T@|$T|g" "$T/template.toml" > "$T/gsyncd.toml"
 cat "$T/gsyncd.toml"
 
+# The target guard requires an explicit marker (or a real mount) before the
+# daemon will write; the target directory already exists above.
+"$BIN" -config "$T/gsyncd.toml" -init-target
 "$BIN" -config "$T/gsyncd.toml" -check
 "$BIN" -config "$T/gsyncd.toml" -nodaemon > "$T/out.log" 2>&1 &
 PID=$!

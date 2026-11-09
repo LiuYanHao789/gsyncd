@@ -57,6 +57,9 @@ excludes = [
 ]
 TOML
 
+echo "== init target marker"
+"$BIN" -config "$T/g.toml" -init-target
+
 echo "== check"
 "$BIN" -config "$T/g.toml" -check
 

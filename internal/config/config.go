@@ -74,6 +74,11 @@ type Global struct {
 	// useful one on a shared disk - the kernel hands the bandwidth to every
 	// other process first.
 	IOPrio string
+	// TargetGuard refuses to start unless each local target already exists and
+	// is on a non-root mount or carries the .gsyncd-target marker. It is the
+	// protection against an unmounted backup disk: without it the daemon would
+	// create the mount point directory on the root filesystem and fill it.
+	TargetGuard bool
 }
 
 // Sync is one source/target pair.
@@ -187,6 +192,7 @@ func Default() Config {
 			StatusInterval: 10 * time.Second,
 			MaxProcesses:   8,
 			MaxPending:     500_000,
+			TargetGuard:    true,
 		},
 	}
 }
@@ -304,7 +310,7 @@ func isGlobalKey(k string) bool {
 	switch normKey(k) {
 	case "logfile", "loglevel", "logmaxsize", "logmaxfiles", "pidfile",
 		"statusfile", "statusinterval", "nodaemon", "maxprocesses",
-		"maxpending", "watchinterval", "fullresync", "memorylimit", "nice", "ioprio":
+		"maxpending", "watchinterval", "fullresync", "memorylimit", "nice", "ioprio", "targetguard":
 		return true
 	}
 	return false
@@ -343,6 +349,8 @@ func applyGlobal(g *Global, t tomlTable) error {
 			g.Nice = int(asInt64(v))
 		case "ioprio":
 			g.IOPrio = asString(v)
+		case "targetguard":
+			g.TargetGuard = asBool(v)
 		default:
 			return fmt.Errorf("global: unknown key %q", k)
 		}

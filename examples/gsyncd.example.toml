@@ -54,6 +54,13 @@ log_level = "info"
 # 以及「到底同步到哪了」的现场判断全靠它。
 status_file = "/var/lib/gsyncd/status.json"
 
+# 目标安全守卫（默认 true）。启动前要求目标已存在，且位于非 / 的挂载点上，
+# 或带有 .gsyncd-target marker；否则拒绝启动，避免目标盘未挂载时把数据写进
+# 本地根分区。首次挂载目标后执行：
+#     gsyncd -config /etc/gsyncd/gsyncd.toml -init-target
+# 目标本身就在独立盘/NFS 挂载点下时通常不需要 marker，但 mark 一次也无害。
+# target_guard = true
+
 # 状态刷新间隔，默认 10s。每次刷新要序列化整份文档并 rename 一次，
 # 别设得太小（<1s 在几十个 sync 时会有可观的无谓 IO）。
 status_interval = "10s"

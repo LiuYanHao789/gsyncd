@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,6 +49,11 @@ type Direct struct {
 	// Off by default because on a large tree it multiplies the copy cost by
 	// an order of magnitude; large files are flushed regardless.
 	Fsync bool
+	// TargetGuard refuses to write unless the target is an existing directory
+	// that is either on a non-root mount or carries the target marker. It is
+	// what stops an unmounted backup disk from turning into a write into the
+	// local root filesystem. Zero value is off so unit tests can use TempDir.
+	TargetGuard bool
 	// Logf receives diagnostics.
 	Logf func(level string, format string, args ...any)
 
@@ -69,6 +76,11 @@ type Direct struct {
 	// pruned counts removals seen by pruneDir so the log can be sampled
 	// without a per-entry message (issue #93: 438 GB of log).
 	pruned int
+	// special counts FIFOs, sockets and device nodes that were skipped. It is
+	// atomic because both the walk goroutine and the copy workers see them.
+	special int64
+	// linksSkipped counts symlinks whose target lies outside the sync root.
+	linksSkipped int64
 	// freshTarget records that the target was empty when the last Startup
 	// began. It turns off the per-file "already identical?" stat and the
 	// per-directory "already exists?" lstat, which together are one wasted
@@ -132,7 +144,15 @@ func (d *Direct) UseCheckpoint(st *scanstate.Store) { d.scan = st }
 // The target prune is folded into the same walk that does the copying (see
 // walkCopy) instead of running as a separate whole-tree pass.
 func (d *Direct) Startup(ctx context.Context) error {
-	if err := os.MkdirAll(d.Target, 0o755); err != nil {
+	if d.TargetGuard {
+		// Never create the target: a missing path is exactly the signal that
+		// the backup filesystem is not mounted, and creating it here would
+		// turn the mirror into a write into whatever directory happens to be
+		// underneath.
+		if err := CheckTarget(d.Target); err != nil {
+			return err
+		}
+	} else if err := os.MkdirAll(d.Target, 0o755); err != nil {
 		return err
 	}
 	d.pruned = 0
@@ -198,7 +218,16 @@ func (d *Direct) pruneDir(ctx context.Context, srcDir, dstDir string, dstEnts []
 	}
 	keep := make(map[string]struct{}, len(srcEnts))
 	for _, e := range srcEnts {
-		keep[e.Name()] = struct{}{}
+		// Only entries this backend can mirror keep their target counterpart.
+		// FIFOs, sockets and device nodes are skipped (copying a FIFO would
+		// block forever), so an old regular file at such a name is stale and
+		// has to be pruned.
+		if e.IsDir() || e.Type().IsRegular() || e.Type()&os.ModeSymlink != 0 {
+			keep[e.Name()] = struct{}{}
+		}
+	}
+	if filepath.Clean(dstDir) == filepath.Clean(d.Target) {
+		keep[TargetMarkerName] = struct{}{}
 	}
 	for _, e := range dstEnts {
 		if _, ok := keep[e.Name()]; ok {
@@ -322,6 +351,7 @@ type pending struct {
 	sealed int32
 	failed int32
 	once   sync.Once
+	logf   func(string, string, ...any)
 }
 
 // finish stamps the target directory with the source directory's mtime.
@@ -338,10 +368,13 @@ func (p *pending) finish() {
 			// next time and get reconciled again, which is the safe direction.
 			return
 		}
-		// A coarse or read-only target filesystem lands here. The cost is that
-		// this directory never matches its record and is re-verified on every
-		// start, never that it is skipped.
-		_ = os.Chtimes(p.dst, p.mtime, p.mtime)
+		// A coarse, read-only or root-squashed target filesystem lands here.
+		// The directory then never matches its record and is re-verified on
+		// every start - the safe direction - but it must not happen silently:
+		// mtime is part of the consistency contract.
+		if err := os.Chtimes(p.dst, p.mtime, p.mtime); err != nil && p.logf != nil {
+			p.logf("warn", "cannot set directory mtime on %s: %v", p.dst, err)
+		}
 	})
 }
 
@@ -401,6 +434,94 @@ func pathWithin(rel, dir string) bool {
 	return len(rel) > len(dir) && rel[len(dir)] == '/' && rel[:len(dir)] == dir
 }
 
+// noteSpecial reports a skipped FIFO/socket/device node, sampling the log the
+// same way pruneDir does (issue #93).
+func (d *Direct) noteSpecial(rel string, info os.FileInfo) {
+	n := atomic.AddInt64(&d.special, 1)
+	if n <= 10 || n%10000 == 0 {
+		d.Logf("info", "skipping non-regular file %s (mode %s)", rel, info.Mode().Type())
+	}
+}
+
+// symlinkTargetFor returns the link text to use on the target. Links that
+// resolve inside the sync root are mirrored; absolute internal links are
+// rewritten to the mirror root so they resolve there. Links pointing outside
+// are not followed and not copied.
+func (d *Direct) symlinkTargetFor(srcPath, link string) (string, bool) {
+	text, ok := symlinkText(d.Source, d.Target, srcPath, link)
+	if !ok {
+		n := atomic.AddInt64(&d.linksSkipped, 1)
+		if n <= 10 || n%10000 == 0 {
+			d.Logf("info", "symlink %s points outside the sync root, not mirrored", srcPath)
+		}
+		return "", false
+	}
+	// A relative link keeps its text: the target tree mirrors the source
+	// tree's shape, so the same relative path resolves to the mirrored file.
+	return text, true
+}
+
+// writeSymlink replaces dst with a symlink to text.
+func writeSymlink(dst, text string) error {
+	dir := filepath.Dir(dst)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, tmpPrefix+"link-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	_ = f.Close()
+	_ = os.Remove(tmp)
+	if err := os.Symlink(text, tmp); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		// Rename cannot replace a non-empty directory; that is a leftover
+		// from a previous type, so remove it and retry once.
+		if rmErr := os.RemoveAll(dst); rmErr == nil {
+			return os.Rename(tmp, dst)
+		}
+		return err
+	}
+	return nil
+}
+
+// syncSymlink mirrors one symlink during the initial pass.
+func (d *Direct) syncSymlink(rel, srcPath string, info os.FileInfo) error {
+	link, err := os.Readlink(srcPath)
+	if err != nil {
+		return err
+	}
+	dst := filepath.Join(d.Target, rel)
+	text, ok := d.symlinkTargetFor(srcPath, link)
+	if !ok {
+		if d.DeleteOnStartup {
+			return os.RemoveAll(dst)
+		}
+		return nil
+	}
+	return writeSymlink(dst, text)
+}
+
+// applySymlink mirrors one symlink for a runtime event.
+func (d *Direct) applySymlink(srcPath, dst string) error {
+	link, err := os.Readlink(srcPath)
+	if err != nil {
+		return err
+	}
+	text, ok := d.symlinkTargetFor(srcPath, link)
+	if !ok {
+		if d.DeleteOnRun {
+			return os.RemoveAll(dst)
+		}
+		return nil
+	}
+	return writeSymlink(dst, text)
+}
+
 // reconcileDir brings one target directory in line with its source: extra
 // entries are removed and staging files left by an interrupted copy are swept.
 // A missing target directory is created when mk is set.
@@ -408,6 +529,12 @@ func (d *Direct) reconcileDir(ctx context.Context, src, dst string, perm os.File
 	ents, err := os.ReadDir(dst)
 	if err != nil {
 		if mk {
+			// A file (or symlink) where a directory belongs is a type change
+			// at the source that happened while the daemon was down. Remove
+			// it, otherwise Mkdir fails with EEXIST and every child fails too.
+			if st, lerr := os.Lstat(dst); lerr == nil && !st.IsDir() {
+				note(os.RemoveAll(dst))
+			}
 			note(mkdirOnce(dst, perm|0o700))
 		}
 		return
@@ -496,6 +623,7 @@ func (d *Direct) walkCopy(ctx context.Context) error {
 	// subtree below it has been walked.
 	var queued []scanstate.Record
 	var emitted, hits, checked, dropped int
+	lastCommit := time.Now()
 
 	flush := func() {
 		for len(queued) > 0 {
@@ -505,10 +633,15 @@ func (d *Direct) walkCopy(ctx context.Context) error {
 			d.scan.Add(queued[0])
 			queued = queued[1:]
 			emitted++
-			if emitted%scanCommitEvery == 0 {
+			// Commit by record count or by time. A SIGKILL between commits
+			// loses only what is still buffered; without the time bound a
+			// small tree could lose its whole checkpoint (fewer than 4096
+			// directories) and restart from zero.
+			if emitted%scanCommitEvery == 0 || time.Since(lastCommit) >= time.Second {
 				if err := d.scan.Commit(); err != nil {
 					d.Logf("warn", "scan state: cannot write %s: %v", d.scan.Path(), err)
 				}
+				lastCommit = time.Now()
 			}
 		}
 	}
@@ -635,9 +768,21 @@ func (d *Direct) walkCopy(ctx context.Context) error {
 			}
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			// Symlinks are not mirrored (see the backend documentation); the
-			// name is still folded so that adding or removing one shows up as
-			// a change instead of going unnoticed.
+			// Internal links are mirrored as links; links pointing outside the
+			// sync root are skipped (and logged) rather than followed: the
+			// target cannot resolve them and following one would smuggle
+			// outside content into the mirror. The name is still folded so
+			// that adding or removing a link shows up as a change.
+			fold(info.Name(), info)
+			note(d.syncSymlink(rel, p, info))
+			return nil
+		}
+		if !info.IsDir() && !info.Mode().IsRegular() {
+			// A FIFO/socket/device node cannot be copied: opening a FIFO
+			// blocks until a writer appears, which would wedge a copy worker
+			// (and the whole pass) forever. Skip it, and let pruneDir remove
+			// any stale regular file at the same name.
+			d.noteSpecial(rel, info)
 			fold(info.Name(), info)
 			return nil
 		}
@@ -661,7 +806,7 @@ func (d *Direct) walkCopy(ctx context.Context) error {
 			}
 			if tracking {
 				fr.hash = scanstate.NewHasher()
-				fr.pd = &pending{dst: dir, mtime: info.ModTime()}
+				fr.pd = &pending{dst: dir, mtime: info.ModTime(), logf: d.Logf}
 				// The record is only usable when the target directory still
 				// carries the timestamp the record expects: that is the only
 				// evidence available without reading the target, and any hand
@@ -746,13 +891,20 @@ func (d *Direct) walkCopy(ctx context.Context) error {
 // It is a heuristic, not a lock: something may write into the target a moment
 // later. It is only ever used to skip work that would have been a no-op.
 func targetIsEmpty(dir string) bool {
-	f, err := os.Open(dir)
+	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return false
 	}
-	defer f.Close()
-	names, err := f.Readdirnames(1)
-	return err != nil || len(names) == 0
+	for _, e := range ents {
+		// The guard marker is not mirrored content; a target that holds only
+		// the marker is still empty for the purposes of the fresh-target fast
+		// path.
+		if e.Name() == TargetMarkerName {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // mkdirOnce creates dir without first asking whether it exists.
@@ -786,13 +938,13 @@ func (d *Direct) copyFileAt(ctx context.Context, rel string, info os.FileInfo) e
 			return nil
 		}
 	}
-	err := copyFile(d.Source+string(filepath.Separator)+rel, dst, info, d.Fsync)
+	err := copyFile(d.Source+string(filepath.Separator)+rel, dst, info, d.Fsync, d.Logf)
 	if errors.Is(err, os.ErrNotExist) {
 		// The directory is missing despite the walk order: another sync
 		// sharing this target removed it, or the walk skipped it because
 		// it was unreadable. Recreate and retry once.
 		if mkErr := os.MkdirAll(filepath.Dir(dst), 0o755); mkErr == nil {
-			err = copyFile(d.Source+string(filepath.Separator)+rel, dst, info, d.Fsync)
+			err = copyFile(d.Source+string(filepath.Separator)+rel, dst, info, d.Fsync, d.Logf)
 		}
 	}
 	if err != nil {
@@ -889,10 +1041,22 @@ func copyBounded(dst io.Writer, src io.Reader, n int64) (int64, error) {
 	return written, nil
 }
 
+// chmodWarn and chtimesWarn keep a metadata failure from flooding the log on
+// a target filesystem that refuses the operation for every file. The first
+// occurrence carries a path and the error; the rest are counted by the copy
+// error path if they matter.
+var chmodWarn, chtimesWarn sync.Once
+
+func warnf(logf func(string, string, ...any), format string, args ...any) {
+	if logf != nil {
+		logf("warn", format, args...)
+	}
+}
+
 // copyFile writes to a temporary file in the destination directory and renames
 // it into place, so a reader on the target never sees a half written file.
 // fsyncAll forces the flush for small files too.
-func copyFile(src, dst string, info os.FileInfo, fsyncAll bool) error {
+func copyFile(src, dst string, info os.FileInfo, fsyncAll bool, logf func(string, string, ...any)) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -931,12 +1095,30 @@ func copyFile(src, dst string, info os.FileInfo, fsyncAll bool) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	_ = os.Chmod(tmpName, info.Mode().Perm())
-	_ = os.Chtimes(tmpName, info.ModTime(), info.ModTime())
+	if err := os.Chmod(tmpName, info.Mode().Perm()); err != nil {
+		chmodWarn.Do(func() { warnf(logf, "cannot set permissions on %s: %v", tmpName, err) })
+	}
+	if err := os.Chtimes(tmpName, info.ModTime(), info.ModTime()); err != nil {
+		// mtime is part of the consistency contract, so a filesystem that
+		// refuses it (root-squashed NFS, some FUSE targets) must be visible.
+		// The copy itself is still correct; verification reports the mismatch.
+		chtimesWarn.Do(func() { warnf(logf, "cannot set mtime on %s: %v", tmpName, err) })
+	}
+	// A directory where a file belongs is a type change; rename(2) cannot
+	// replace it, and leaving it would make every later copy of this path
+	// fail. Only directories are removed here, and only for this exact path.
+	if st, err := os.Lstat(dst); err == nil && st.IsDir() {
+		_ = os.RemoveAll(dst)
+	}
 	if err := os.Rename(tmpName, dst); err != nil {
-		// Windows refuses to rename over an existing file in some cases.
-		if rmErr := os.Remove(dst); rmErr == nil {
-			err = os.Rename(tmpName, dst)
+		// Windows refuses to rename over an existing file in some cases. On
+		// POSIX/NFS a failed rename must not be retried after unlinking the
+		// destination: that would turn a transient error (ESTALE/EIO) into
+		// the loss of the previously correct target file.
+		if runtime.GOOS == "windows" {
+			if rmErr := os.Remove(dst); rmErr == nil {
+				err = os.Rename(tmpName, dst)
+			}
 		}
 		if err != nil {
 			return err
@@ -958,15 +1140,31 @@ func (d *Direct) Apply(ctx context.Context, b Batch) error {
 	}
 
 	// Renames first: they are cheap and free the old name before a possible
-	// copy of a file with the same path.
-	var renames, rest []aggregate.Change
+	// copy of a file with the same path. Directory changes run next and
+	// sequentially, so a directory recreate/removal finishes before any file
+	// under it is written; otherwise a worker could copy a new file and a
+	// concurrent RemoveAll could delete it again.
+	var renames, dirs, rest []aggregate.Change
 	for _, c := range b.Changes {
-		if c.From != "" && c.Op&event.Delete == 0 {
+		switch {
+		case c.From != "" && c.Op&event.Delete == 0:
 			renames = append(renames, c)
-		} else {
+		case c.Kind == aggregate.KindDir:
+			dirs = append(dirs, c)
+		default:
 			rest = append(rest, c)
 		}
 	}
+	// Ancestor renames must run before renames of their descendants: a file
+	// renamed inside a directory that is itself renamed is retargeted to the
+	// new directory, which has to exist on the target first.
+	sort.SliceStable(renames, func(i, j int) bool {
+		di, dj := pathDepth(renames[i].From), pathDepth(renames[j].From)
+		if di != dj {
+			return di < dj
+		}
+		return renames[i].From < renames[j].From
+	})
 	// Every failure has to reach the caller, not just the first one that fits
 	// in a buffered channel. A batch that reports success while some of its
 	// files were never written leaves the mirror silently wrong until the next
@@ -990,6 +1188,33 @@ func (d *Direct) Apply(ctx context.Context, b Batch) error {
 			// applyRename already fell back to a copy; a failure here means
 			// both paths failed.
 			d.Logf("warn", "rename %s -> %s: %v", c.From, c.Path, err)
+			note(err)
+		}
+	}
+	// Directory operations are ordered by depth (ancestors first) and deletes
+	// before creates at the same depth. That is what makes "delete a directory
+	// and recreate it" deterministic instead of racing a descendant copy.
+	sort.SliceStable(dirs, func(i, j int) bool {
+		di, dj := pathDepth(dirs[i].Path), pathDepth(dirs[j].Path)
+		if di != dj {
+			return di < dj
+		}
+		idel := dirs[i].Op&event.Delete != 0 && dirs[i].Op&(event.Create|event.Write) == 0
+		jdel := dirs[j].Op&event.Delete != 0 && dirs[j].Op&(event.Create|event.Write) == 0
+		if idel != jdel {
+			return idel
+		}
+		return dirs[i].Path < dirs[j].Path
+	})
+	for _, c := range dirs {
+		select {
+		case <-ctx.Done():
+			note(ctx.Err())
+			continue
+		default:
+		}
+		if err := d.applyOne(ctx, c); err != nil {
+			d.Logf("debug", "apply dir %s: %v", c.Path, err)
 			note(err)
 		}
 	}
@@ -1043,6 +1268,12 @@ func (d *Direct) Apply(ctx context.Context, b Batch) error {
 // that escapes the source would make filepath.Join produce something outside the
 // destination — writing or deleting data the operator never pointed at. Events
 // are routed before they get here; this is the belt to that suspenders.
+// pathDepth counts path components; used to apply ancestors before
+// descendants.
+func pathDepth(p string) int {
+	return strings.Count(filepath.ToSlash(p), "/")
+}
+
 func (d *Direct) relInside(p string) (string, error) {
 	rel, ok := relInSource(d.Source, p)
 	if !ok {
@@ -1080,11 +1311,17 @@ func (d *Direct) applyRename(ctx context.Context, c aggregate.Change) error {
 	if err := os.MkdirAll(filepath.Dir(dstDst), 0o755); err != nil {
 		return err
 	}
-	if err := os.Rename(srcDst, dstDst); err == nil {
-		atomic.AddUint64(&d.st.Files, 1)
-		return nil
+	// A pending write was folded into this move (aggregate.applyMove carries
+	// Write/Create through a rename). Renaming the old target file would move
+	// the stale copy to the new name, so the content has to be copied.
+	dirty := c.Op&(event.Create|event.Write) != 0
+	if !dirty {
+		if err := os.Rename(srcDst, dstDst); err == nil {
+			atomic.AddUint64(&d.st.Files, 1)
+			return nil
+		}
 	}
-	// Cross-device or missing source on the target: fall back to copy+remove.
+	// Cross-device, missing source on the target, or a dirty move: copy+remove.
 	if info, serr := os.Lstat(c.Path); serr == nil {
 		if info.IsDir() {
 			// Ignore takes root-relative paths, copyTree hands out paths
@@ -1097,12 +1334,22 @@ func (d *Direct) applyRename(ctx context.Context, c aggregate.Change) error {
 					return d.Ignore(filepath.ToSlash(filepath.Join(relTo, rel)), dir)
 				}
 			}
-			if err := copyTree(c.Path, dstDst, d.Fsync, ign); err != nil {
+			if err := copyTree(c.Path, dstDst, d.Source, d.Target, d.Fsync, ign, d.Logf); err != nil {
 				return err
 			}
-		} else if err := copyFile(c.Path, dstDst, info, d.Fsync); err != nil {
+		} else if info.Mode()&os.ModeSymlink != 0 {
+			if err := d.applySymlink(c.Path, dstDst); err != nil {
+				return err
+			}
+		} else if !info.Mode().IsRegular() {
+			d.noteSpecial(relTo, info)
+		} else if err := copyFile(c.Path, dstDst, info, d.Fsync, d.Logf); err != nil {
 			return err
 		}
+	} else if dirty {
+		// The source vanished after the rename event; the destination must not
+		// keep an old copy under the new name.
+		_ = os.RemoveAll(dstDst)
 	}
 	_ = os.RemoveAll(srcDst)
 	atomic.AddUint64(&d.st.Files, 1)
@@ -1142,12 +1389,28 @@ func (d *Direct) applyOne(ctx context.Context, c aggregate.Change) error {
 		}
 		return err
 	}
+	// A path deleted and recreated in the same window must not keep anything
+	// the source removed, for every type: dir -> file, file -> dir, or a
+	// symlink replacing a regular file. This is the one case where a create
+	// carries an implied removal.
+	if c.Recreate && d.DeleteOnRun {
+		if err := os.RemoveAll(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		return nil
+		return d.applySymlink(c.Path, dst)
 	}
 	if info.IsDir() {
 		if err := os.MkdirAll(dst, info.Mode().Perm()|0o700); err != nil {
 			return err
+		}
+		return nil
+	}
+	if !info.Mode().IsRegular() {
+		d.noteSpecial(rel, info)
+		if d.DeleteOnRun {
+			return os.RemoveAll(dst)
 		}
 		return nil
 	}
@@ -1166,7 +1429,7 @@ func (d *Direct) applyOne(ctx context.Context, c aggregate.Change) error {
 			return nil
 		}
 	}
-	if err := copyFile(c.Path, dst, info, d.Fsync); err != nil {
+	if err := copyFile(c.Path, dst, info, d.Fsync, d.Logf); err != nil {
 		return err
 	}
 	atomic.AddUint64(&d.st.Files, 1)
@@ -1179,7 +1442,7 @@ func (d *Direct) applyOne(ctx context.Context, c aggregate.Change) error {
 // walk applies: otherwise a single mv of a parent directory would smuggle every
 // *.tmp and cache/ below it onto the target, where a fresh run would never put
 // them.
-func copyTree(src, dst string, fsyncAll bool, ignore func(rel string, dir bool) bool) error {
+func copyTree(src, dst, srcRoot, dstRoot string, fsyncAll bool, ignore func(rel string, dir bool) bool, logf func(string, string, ...any)) error {
 	return filepath.Walk(src, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
@@ -1194,19 +1457,57 @@ func copyTree(src, dst string, fsyncAll bool, ignore func(rel string, dir bool) 
 			}
 			return nil
 		}
-		// Same rule as the initial walk and applyOne: a symlink is not
-		// mirrored. Copying one would silently materialise whatever it points
-		// at - possibly outside the tree, possibly a loop.
-		if info.Mode()&os.ModeSymlink != 0 {
-			return nil
-		}
 		out := filepath.Join(dst, rel)
+		if info.Mode()&os.ModeSymlink != 0 {
+			link, lerr := os.Readlink(p)
+			if lerr != nil {
+				return nil
+			}
+			text, ok := symlinkText(srcRoot, dstRoot, p, link)
+			if !ok {
+				if logf != nil {
+					logf("info", "symlink %s points outside the sync root, not mirrored", p)
+				}
+				return nil
+			}
+			return writeSymlink(out, text)
+		}
 		if info.IsDir() {
 			return os.MkdirAll(out, info.Mode().Perm()|0o700)
+		}
+		if !info.Mode().IsRegular() {
+			if logf != nil {
+				logf("info", "skipping non-regular file %s (mode %s)", p, info.Mode().Type())
+			}
+			return nil
 		}
 		if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 			return err
 		}
-		return copyFile(p, out, info, fsyncAll)
+		return copyFile(p, out, info, fsyncAll, logf)
 	})
+}
+
+// symlinkText returns the link text to write on the target. Links resolving
+// inside srcRoot are mirrored (absolute ones rewritten under dstRoot); links
+// pointing outside are reported as not mirrorable.
+func symlinkText(srcRoot, dstRoot, srcPath, link string) (string, bool) {
+	var resolved string
+	if filepath.IsAbs(link) {
+		resolved = filepath.Clean(link)
+	} else {
+		resolved = filepath.Clean(filepath.Join(filepath.Dir(srcPath), link))
+	}
+	root := filepath.Clean(srcRoot)
+	if resolved == root {
+		return filepath.Clean(dstRoot), true
+	}
+	rel, ok := relInSource(root, resolved)
+	if !ok {
+		return "", false
+	}
+	if filepath.IsAbs(link) {
+		return filepath.Join(dstRoot, rel), true
+	}
+	return link, true
 }

@@ -15,6 +15,19 @@ func buildTree(t testing.TB, roots, fan, depth int) (*Tree, []string) {
 	t.Helper()
 	tree := New(newLimitBackend(1<<30), Options{Workers: 1})
 	t.Cleanup(func() { tree.Close() })
+	// handle() emits one event per deletion; without a consumer a long
+	// benchmark fills the 65536-entry channel and blocks (the runtime then
+	// reports "all goroutines are asleep"). The daemon always has the engine
+	// draining it, so the benchmark has to as well.
+	go func() {
+		for {
+			select {
+			case <-tree.out:
+			case <-tree.done:
+				return
+			}
+		}
+	}()
 	tree.roots["/r"] = true
 	level := make([]string, 0, roots)
 	for i := 0; i < roots; i++ {

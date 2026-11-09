@@ -29,6 +29,12 @@ type Change struct {
 	Kind Kind
 	// At is the first time this path was touched in the window.
 	At time.Time
+	// Recreate marks a directory that was deleted and created again inside the
+	// same window. The target directory has to be removed before it is
+	// recreated: the entries that were deleted at the source would otherwise
+	// survive in the mirror, because a recreated directory carries no implied
+	// removal of its old contents.
+	Recreate bool
 
 	// open records whether the newest thing that happened to this path was a
 	// write whose writer has not closed the file yet. It is not derivable
@@ -192,11 +198,18 @@ func (a *Aggregator) upsertKnown(c Change, keepOpen bool) {
 	if i, ok := a.index[c.Path]; ok {
 		old := &a.items[i]
 		merged := old.Op | c.Op
-		// delete then create == a modify of whatever is there now.
+		// delete then create == a modify of whatever is there now. For a file
+		// that is an atomic replace; for a directory it is not - the target
+		// still holds the old entries, so the delete has to be preserved as a
+		// recreate rather than folded away.
 		if old.Op&event.Delete != 0 && c.Op&(event.Create|event.Write) != 0 {
 			merged = (merged &^ event.Delete) | event.Write
-			if c.Kind == KindDir {
+			if c.Kind == KindDir || old.Kind == KindDir {
 				merged &^= event.Write
+				if merged&event.Create == 0 {
+					merged |= event.Create
+				}
+				old.Recreate = true
 			}
 		}
 		// create then delete == nothing happened.
@@ -368,9 +381,15 @@ func (a *Aggregator) applyMove(ev event.Event) {
 	// prevent - and it would be the hardest one to reproduce, since it needs
 	// a rename during a write.
 	var wasOpen bool
+	// carried keeps a pending content change attached to the file through the
+	// rename. Without it "write, then mv" produces a Move-only change: the
+	// target rename would move the old, stale copy to the new name and the
+	// write would never reach the mirror.
+	var carried event.Op
 	if ev.IsDir {
 		a.followRename(ev.From, ev.Path)
 	} else if i, ok := a.index[ev.From]; ok {
+		carried = a.items[i].Op & (event.Create | event.Write | event.Attrib)
 		wasOpen = a.items[i].open
 		a.removeAt(i)
 	}
@@ -382,29 +401,27 @@ func (a *Aggregator) applyMove(ev event.Event) {
 		kind = KindDir
 	}
 	if ev.Op&event.Create != 0 && ev.From == "" {
-		a.upsert(Change{Path: ev.Path, Op: event.Create, Kind: kind, At: ev.At, open: wasOpen})
+		a.upsert(Change{Path: ev.Path, Op: event.Create | carried, Kind: kind, At: ev.At, open: wasOpen})
 		return
 	}
-	a.upsert(Change{Path: ev.Path, From: ev.From, Op: event.Move, Kind: kind, At: ev.At, open: wasOpen})
+	a.upsert(Change{Path: ev.Path, From: ev.From, Op: event.Move | carried, Kind: kind, At: ev.At, open: wasOpen})
 }
 
 // followRename moves pending children of a renamed directory to their new
 // names.
 //
-// A directory rename carries the whole subtree in one operation, so a pending
-// create or write below the old name is already handled by the rename itself:
-// keeping it would send the engine a hundred thousand paths that no longer
-// exist, which are then mirrored as deletes of good data. A pending *delete*
-// below the old name is different - the rename does not carry a removal - so it
-// is retargeted at the new path instead of being dropped, or the copy of a file
-// deleted just before the rename would stay on the target forever.
+// A directory rename on the target only moves the directory as it exists
+// there. It does not carry pending content changes made at the source, so
+// every pending entry below the old name - create, write, delete or a nested
+// rename - has to be retargeted at the new prefix. Dropping the non-deletes
+// (the old behaviour) silently lost writes and renames that had not been
+// transferred yet, leaving stale content under the new directory name.
 func (a *Aggregator) followRename(from, to string) {
 	// Only the renamed subtree can hold affected entries, so this walks that
 	// subtree instead of the whole window. Scanning the window made "rename N
 	// directories" cost N x (window size), the same quadratic shape the delete
 	// path had.
 	victims := a.subtreePaths(from, nil)
-	dropped := 0
 	var retarget []Change
 	for _, p := range victims {
 		i, ok := a.index[p]
@@ -412,21 +429,33 @@ func (a *Aggregator) followRename(from, to string) {
 			continue
 		}
 		c := a.items[i]
-		if p != from && c.IsDelete() {
-			c.Path = to + p[len(from):]
+		if p != from {
+			suffix := p[len(from):]
+			c.Path = to + suffix
+			if c.From != "" && underPath(from, c.From) {
+				c.From = to + c.From[len(from):]
+			}
 			retarget = append(retarget, c)
-		} else {
-			dropped++
 		}
 		// Look the index up again: removeAt swaps the tail into i.
 		if j, ok := a.index[p]; ok {
 			a.removeAt(j)
 		}
 	}
-	a.stats.Collapsed += uint64(dropped)
 	for _, c := range retarget {
 		a.upsert(c)
 	}
+}
+
+// underPath reports whether p is root itself or lives below it.
+func underPath(root, p string) bool {
+	if p == root {
+		return true
+	}
+	if len(p) <= len(root) || p[:len(root)] != root {
+		return false
+	}
+	return p[len(root)] == '/' || p[len(root)] == '\\'
 }
 
 // dropSubtree removes every pending entry at or below root, walking only that

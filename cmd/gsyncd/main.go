@@ -51,6 +51,7 @@ type flags struct {
 	once       bool
 	showStatus string
 	check      bool
+	initTarget bool
 	watchEvery time.Duration
 	fullResync time.Duration
 	printVer   bool
@@ -68,6 +69,7 @@ func parseFlags(args []string) (flags, error) {
 	fs.BoolVar(&f.once, "once", false, "run the initial sync and exit")
 	fs.StringVar(&f.showStatus, "status", "", "print the status file at PATH and exit")
 	fs.BoolVar(&f.check, "check", false, "validate the configuration and exit")
+	fs.BoolVar(&f.initTarget, "init-target", false, "write the .gsyncd-target marker into every local target and exit (the target must already exist)")
 	fs.DurationVar(&f.watchEvery, "watch-interval", 0, "poll interval for the portable backend (0 = default)")
 	fs.DurationVar(&f.fullResync, "full-resync", -1, "periodic full resync interval (-1 = use the config)")
 	fs.BoolVar(&f.printVer, "version", false, "print the version and exit")
@@ -122,7 +124,33 @@ func run() error {
 	if f.fullResync >= 0 {
 		cfg.Global.FullResync = f.fullResync
 	}
+	if f.initTarget {
+		// The target must already exist: creating it here would remove the
+		// only signal that an unmounted filesystem is being pointed at.
+		for i := range cfg.Syncs {
+			s := &cfg.Syncs[i]
+			if !localTarget(*s) {
+				continue
+			}
+			if err := syncpkg.InitTarget(s.Target); err != nil {
+				return fmt.Errorf("sync %q: %w", s.Name, err)
+			}
+			fmt.Printf("initialised target %s\n", s.Target)
+		}
+		return nil
+	}
 	if f.check {
+		if cfg.Global.TargetGuard {
+			for i := range cfg.Syncs {
+				s := &cfg.Syncs[i]
+				if !localTarget(*s) {
+					continue
+				}
+				if err := syncpkg.CheckTarget(s.Target); err != nil {
+					return fmt.Errorf("sync %q: %w", s.Name, err)
+				}
+			}
+		}
 		fmt.Printf("configuration OK: %d sync(s)\n", len(cfg.Syncs))
 		return nil
 	}
@@ -351,11 +379,23 @@ const rootCheckInterval = 10 * time.Second
 func superviseRoots(ctx context.Context, tree *watcher.Tree, eng *engine.Engine, logger *logx.Logger, syncs []config.Sync) {
 	t := time.NewTicker(rootCheckInterval)
 	defer t.Stop()
+	warnedUnwatched := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		}
+		// The watch table can fill up after startup as new directories appear.
+		// When that happens events under them are invisible, and the only way
+		// back to consistency is the periodic wholesale resync. main() can
+		// only check this once, before the first directory is created.
+		if n := tree.Unwatched(); n > 0 && eng.FullResync() == 0 {
+			eng.SetFullResync(time.Hour)
+			if !warnedUnwatched {
+				logger.Warnf("%d directories could not be watched after startup, falling back to a full resync every hour", n)
+				warnedUnwatched = true
+			}
 		}
 		for _, s := range syncs {
 			src := filepath.Clean(s.Source)
@@ -431,6 +471,18 @@ func maxHold(d time.Duration) time.Duration {
 	return d
 }
 
+// localTarget reports whether the target is a filesystem path this process can
+// stat. rsyncssh and rsync's host:path form name a remote endpoint instead.
+func localTarget(s config.Sync) bool {
+	if s.Mode == config.ModeRsyncSSH {
+		return false
+	}
+	if s.Mode == config.ModeRsync && strings.Contains(s.Target, ":") {
+		return false
+	}
+	return true
+}
+
 func buildBackend(s *config.Sync, g config.Global, logger *logx.Logger, flt *filter.Filter) (syncpkg.Backend, error) {
 	logf := func(level string, format string, args ...any) {
 		switch level {
@@ -451,6 +503,7 @@ func buildBackend(s *config.Sync, g config.Global, logger *logx.Logger, flt *fil
 		d.DeleteOnRun = s.RunningDelete()
 		d.Fsync = s.Fsync
 		d.Prefetch = s.Prefetch
+		d.TargetGuard = g.TargetGuard
 		if !flt.Empty() {
 			d.Ignore = flt.Match
 		}
@@ -465,6 +518,7 @@ func buildBackend(s *config.Sync, g config.Global, logger *logx.Logger, flt *fil
 		r.DeleteOnRun = s.RunningDelete()
 		r.BatchLimit = s.BatchLimit
 		r.Excludes = s.Excludes
+		r.TargetGuard = g.TargetGuard
 		r.OnLine = func(line string) { logger.Debugf("[%s] rsync: %s", s.Name, line) }
 		return r, nil
 	case config.ModeRsyncSSH:
