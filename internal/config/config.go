@@ -155,6 +155,15 @@ type Sync struct {
 	// fewer, so it can be deleted at any time without consequences.
 	Checkpoint string
 
+	// Verify enables transfer-time content verification in the direct backend:
+	// the source is hashed while copying and the staged file is read back and
+	// hashed before the rename. It is on by default; size+mtime is only an
+	// incremental-scan hint, not evidence of equality.
+	Verify bool
+	// VerifyRetries is how many extra copy attempts a verification mismatch
+	// gets before the file is reported as failed.
+	VerifyRetries int
+
 	SSH SSH
 }
 
@@ -362,11 +371,13 @@ func applySync(t tomlTable) (Sync, error) {
 	// direct is the default: it needs no rsync and no ssh, which is the
 	// whole point of a single static binary.
 	s := Sync{
-		Mode:       ModeDirect,
-		Delay:      15 * time.Second,
-		Delete:     true,
-		DeleteMode: "",
-		BatchLimit: 10_000,
+		Mode:          ModeDirect,
+		Delay:         15 * time.Second,
+		Delete:        true,
+		DeleteMode:    "",
+		BatchLimit:    10_000,
+		Verify:        true,
+		VerifyRetries: 2,
 	}
 	for k, v := range t {
 		switch normKey(k) {
@@ -426,6 +437,10 @@ func applySync(t tomlTable) (Sync, error) {
 			s.BatchLimit = int(asInt64(v))
 		case "fsync":
 			s.Fsync = asBool(v)
+		case "verify":
+			s.Verify = asBool(v)
+		case "verifyretries", "verify_retries":
+			s.VerifyRetries = int(asInt64(v))
 		case "ssh":
 			st, ok := v.(tomlTable)
 			if !ok {

@@ -50,7 +50,7 @@ func BenchmarkCopyBounded(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		benchWrite(b, dir, func(dst io.Writer, src io.Reader, n int64) error {
-			_, err := copyBounded(dst, src, n)
+			_, err := copyBounded(dst, src, n, nil)
 			return err
 		}, data)
 	}
@@ -74,7 +74,7 @@ func BenchmarkCopyNBounded(b *testing.B) {
 func TestCopyBoundedStopsAtN(t *testing.T) {
 	src := bytes.NewReader(bytes.Repeat([]byte("x"), 5000))
 	var dst bytes.Buffer
-	n, err := copyBounded(&dst, src, 3000)
+	n, err := copyBounded(&dst, src, 3000, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +88,7 @@ func TestCopyBoundedStopsAtN(t *testing.T) {
 func TestCopyBoundedToleratesShortSource(t *testing.T) {
 	src := bytes.NewReader([]byte("short"))
 	var dst bytes.Buffer
-	n, err := copyBounded(&dst, src, 4096)
+	n, err := copyBounded(&dst, src, 4096, nil)
 	if err != nil {
 		t.Fatalf("short source returned an error: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestCopyBoundedToleratesShortSource(t *testing.T) {
 // the pool or the destination at all.
 func TestCopyBoundedZeroLength(t *testing.T) {
 	var dst bytes.Buffer
-	n, err := copyBounded(&dst, bytes.NewReader([]byte("ignored")), 0)
+	n, err := copyBounded(&dst, bytes.NewReader([]byte("ignored")), 0, nil)
 	if err != nil || n != 0 || dst.Len() != 0 {
 		t.Fatalf("n=%d err=%v dst=%d, want 0/nil/0", n, err, dst.Len())
 	}
@@ -112,7 +112,7 @@ func TestCopyBoundedZeroLength(t *testing.T) {
 // tiny slices and quietly lose the throughput this whole change is about.
 func TestCopyBoundedReturnsFullBufferToPool(t *testing.T) {
 	var dst bytes.Buffer
-	if _, err := copyBounded(&dst, bytes.NewReader([]byte("abc")), 3); err != nil {
+	if _, err := copyBounded(&dst, bytes.NewReader([]byte("abc")), 3, nil); err != nil {
 		t.Fatal(err)
 	}
 	bp := copyBufPool.Get().(*[]byte)

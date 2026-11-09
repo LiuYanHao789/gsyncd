@@ -1,9 +1,12 @@
 package sync
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -54,6 +57,13 @@ type Direct struct {
 	// what stops an unmounted backup disk from turning into a write into the
 	// local root filesystem. Zero value is off so unit tests can use TempDir.
 	TargetGuard bool
+	// Verify enables transfer-time content verification: the source is hashed
+	// while it is copied, the staged file is hashed again before the rename,
+	// and a mismatch is retried. It is on by default in the daemon (the zero
+	// value is off so unit tests do not pay for it).
+	Verify bool
+	// VerifyRetries is how many extra copy attempts a mismatch gets.
+	VerifyRetries int
 	// Logf receives diagnostics.
 	Logf func(level string, format string, args ...any)
 
@@ -107,7 +117,7 @@ func NewDirect(source, target string, del bool, workers int, logf func(string, s
 	return &Direct{
 		Source: source, Target: target,
 		Delete: del, DeleteOnStartup: del, DeleteOnRun: del,
-		Workers: workers, Logf: logf,
+		Workers: workers, Logf: logf, VerifyRetries: 2,
 	}
 }
 
@@ -938,13 +948,13 @@ func (d *Direct) copyFileAt(ctx context.Context, rel string, info os.FileInfo) e
 			return nil
 		}
 	}
-	err := copyFile(d.Source+string(filepath.Separator)+rel, dst, info, d.Fsync, d.Logf)
+	err := copyFile(d.Source+string(filepath.Separator)+rel, dst, info, d.Fsync, d.Verify, d.VerifyRetries, d.Logf)
 	if errors.Is(err, os.ErrNotExist) {
 		// The directory is missing despite the walk order: another sync
 		// sharing this target removed it, or the walk skipped it because
 		// it was unreadable. Recreate and retry once.
 		if mkErr := os.MkdirAll(filepath.Dir(dst), 0o755); mkErr == nil {
-			err = copyFile(d.Source+string(filepath.Separator)+rel, dst, info, d.Fsync, d.Logf)
+			err = copyFile(d.Source+string(filepath.Separator)+rel, dst, info, d.Fsync, d.Verify, d.VerifyRetries, d.Logf)
 		}
 	}
 	if err != nil {
@@ -996,7 +1006,7 @@ var copyBufPool = sync.Pool{
 // the sendfile/copy_file_range path) and, once that path is gone, silently uses
 // a 32 KiB buffer. Both of those are invisible in the code and both cost real
 // throughput on a spinning or virtualised device.
-func copyBounded(dst io.Writer, src io.Reader, n int64) (int64, error) {
+func copyBounded(dst io.Writer, src io.Reader, n int64, h hash.Hash) (int64, error) {
 	if n <= 0 {
 		return 0, nil
 	}
@@ -1022,6 +1032,9 @@ func copyBounded(dst io.Writer, src io.Reader, n int64) (int64, error) {
 		}
 		r, err := src.Read(buf[:want])
 		if r > 0 {
+			if h != nil {
+				_, _ = h.Write(buf[:r])
+			}
 			w, werr := dst.Write(buf[:r])
 			written += int64(w)
 			if werr != nil {
@@ -1053,15 +1066,48 @@ func warnf(logf func(string, string, ...any), format string, args ...any) {
 	}
 }
 
+// ErrVerifyMismatch marks a staged copy whose bytes differ from the source.
+var ErrVerifyMismatch = errors.New("content verification mismatch")
+
 // copyFile writes to a temporary file in the destination directory and renames
 // it into place, so a reader on the target never sees a half written file.
 // fsyncAll forces the flush for small files too.
-func copyFile(src, dst string, info os.FileInfo, fsyncAll bool, logf func(string, string, ...any)) error {
+//
+// With verify set, the source is hashed while it is copied and the staged file
+// is read back and hashed before the rename. A mismatch retries from scratch;
+// the previously correct target is untouched until the rename, so a failed
+// verification never destroys good data.
+func copyFile(src, dst string, info os.FileInfo, fsyncAll, verify bool, retries int, logf func(string, string, ...any)) error {
+	if retries < 0 {
+		retries = 0
+	}
+	var last error
+	for attempt := 0; attempt <= retries; attempt++ {
+		err := copyFileOnce(src, dst, info, fsyncAll, verify, logf)
+		if err == nil {
+			return nil
+		}
+		last = err
+		if !verify || !errors.Is(err, ErrVerifyMismatch) {
+			return err
+		}
+		warnf(logf, "content verification failed for %s (attempt %d/%d): %v", dst, attempt+1, retries+1, err)
+		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+	}
+	return last
+}
+
+func copyFileOnce(src, dst string, info os.FileInfo, fsyncAll, verify bool, logf func(string, string, ...any)) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
+
+	var srcHash hash.Hash
+	if verify {
+		srcHash = sha256.New()
+	}
 
 	dir := filepath.Dir(dst)
 	tmp, err := os.CreateTemp(dir, tmpPrefix+"*")
@@ -1082,7 +1128,7 @@ func copyFile(src, dst string, info os.FileInfo, fsyncAll bool, logf func(string
 	// and the next pass could conclude the file is already up to date. A short
 	// read only happens if the file shrank, which is harmless: the next event
 	// brings it back.
-	if _, err := copyBounded(tmp, in, info.Size()); err != nil {
+	if _, err := copyBounded(tmp, in, info.Size(), srcHash); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -1094,6 +1140,11 @@ func copyFile(src, dst string, info os.FileInfo, fsyncAll bool, logf func(string
 	}
 	if err := tmp.Close(); err != nil {
 		return err
+	}
+	if verify {
+		if err := verifyStaged(tmpName, info.Size(), srcHash); err != nil {
+			return err
+		}
 	}
 	if err := os.Chmod(tmpName, info.Mode().Perm()); err != nil {
 		chmodWarn.Do(func() { warnf(logf, "cannot set permissions on %s: %v", tmpName, err) })
@@ -1125,6 +1176,26 @@ func copyFile(src, dst string, info os.FileInfo, fsyncAll bool, logf func(string
 		}
 	}
 	tmpName = ""
+	return nil
+}
+
+// verifyStaged reads the staged file back and compares its hash with the
+// source's. Reading through the same mount may be served by the client cache;
+// that verifies what readers of this mount will see, not necessarily the
+// server's stable storage.
+func verifyStaged(path string, size int64, want hash.Hash) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	got := sha256.New()
+	if _, err := copyBounded(io.Discard, f, size, got); err != nil {
+		return err
+	}
+	if !bytes.Equal(got.Sum(nil), want.Sum(nil)) {
+		return fmt.Errorf("%w: %s", ErrVerifyMismatch, path)
+	}
 	return nil
 }
 
@@ -1334,7 +1405,7 @@ func (d *Direct) applyRename(ctx context.Context, c aggregate.Change) error {
 					return d.Ignore(filepath.ToSlash(filepath.Join(relTo, rel)), dir)
 				}
 			}
-			if err := copyTree(c.Path, dstDst, d.Source, d.Target, d.Fsync, ign, d.Logf); err != nil {
+			if err := copyTree(c.Path, dstDst, d.Source, d.Target, d.Fsync, d.Verify, d.VerifyRetries, ign, d.Logf); err != nil {
 				return err
 			}
 		} else if info.Mode()&os.ModeSymlink != 0 {
@@ -1343,7 +1414,7 @@ func (d *Direct) applyRename(ctx context.Context, c aggregate.Change) error {
 			}
 		} else if !info.Mode().IsRegular() {
 			d.noteSpecial(relTo, info)
-		} else if err := copyFile(c.Path, dstDst, info, d.Fsync, d.Logf); err != nil {
+		} else if err := copyFile(c.Path, dstDst, info, d.Fsync, d.Verify, d.VerifyRetries, d.Logf); err != nil {
 			return err
 		}
 	} else if dirty {
@@ -1429,7 +1500,7 @@ func (d *Direct) applyOne(ctx context.Context, c aggregate.Change) error {
 			return nil
 		}
 	}
-	if err := copyFile(c.Path, dst, info, d.Fsync, d.Logf); err != nil {
+	if err := copyFile(c.Path, dst, info, d.Fsync, d.Verify, d.VerifyRetries, d.Logf); err != nil {
 		return err
 	}
 	atomic.AddUint64(&d.st.Files, 1)
@@ -1442,7 +1513,7 @@ func (d *Direct) applyOne(ctx context.Context, c aggregate.Change) error {
 // walk applies: otherwise a single mv of a parent directory would smuggle every
 // *.tmp and cache/ below it onto the target, where a fresh run would never put
 // them.
-func copyTree(src, dst, srcRoot, dstRoot string, fsyncAll bool, ignore func(rel string, dir bool) bool, logf func(string, string, ...any)) error {
+func copyTree(src, dst, srcRoot, dstRoot string, fsyncAll, verify bool, retries int, ignore func(rel string, dir bool) bool, logf func(string, string, ...any)) error {
 	return filepath.Walk(src, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
@@ -1484,7 +1555,7 @@ func copyTree(src, dst, srcRoot, dstRoot string, fsyncAll bool, ignore func(rel 
 		if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 			return err
 		}
-		return copyFile(p, out, info, fsyncAll, logf)
+		return copyFile(p, out, info, fsyncAll, verify, retries, logf)
 	})
 }
 

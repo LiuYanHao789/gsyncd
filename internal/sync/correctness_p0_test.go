@@ -2,6 +2,8 @@ package sync
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -156,6 +158,32 @@ func TestStartupTypeChangeDirToFile(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join(dst, "x"))
 	if err != nil || string(body) != "new file" {
 		t.Fatalf("target file content = %q, %v", body, err)
+	}
+}
+
+func TestVerifyStagedDetectsMismatch(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "f")
+	write(t, p, "actual")
+	h := sha256.New()
+	_, _ = h.Write([]byte("expected"))
+	err := verifyStaged(p, int64(len("actual")), h)
+	if !errors.Is(err, ErrVerifyMismatch) {
+		t.Fatalf("want verify mismatch, got %v", err)
+	}
+}
+
+func TestStartupWithVerifyCopiesContent(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	write(t, filepath.Join(src, "a", "b"), "verified content")
+	d := NewDirect(src, dst, true, 2, nil)
+	d.Verify = true
+	d.VerifyRetries = 1
+	if err := d.Startup(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(dst, "a", "b"))
+	if err != nil || string(body) != "verified content" {
+		t.Fatalf("verified copy = %q, %v", body, err)
 	}
 }
 

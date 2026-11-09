@@ -188,6 +188,13 @@ excludes = ["*.tmp", "*.swp", "*~", "/cache/", "/.git/", "node_modules/", "/lost
 # 需要「断电后目标端也绝对完整」时（目标端是唯一备份）设为 true。
 fsync = false
 
+# 传输时内容校验（默认 true）：边拷边算 SHA-256，rename 前读回暂存文件复核，
+# 不一致自动重拷；verify_retries 是额外重试次数。代价是每个文件多读一遍。
+# 全量/抽样深校验用命令行：gsyncd -config ... -verify-content [-verify-sample N]
+#                                 gsyncd -config ... -verify-tree
+# verify = true
+# verify_retries = 2
+
 # 树一直不静默时（有文件被持续写）最多等这么久就强制刷一次。默认 1h。
 # 判的是窗口里最老的那条变更，不是逐路径判 —— 所以一个长驻写入方会把同窗口
 # 的其他文件一起按这个节奏刷出去（内容正确，只是批次更碎）。

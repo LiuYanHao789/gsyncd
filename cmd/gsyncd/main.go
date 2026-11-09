@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -28,6 +29,7 @@ import (
 	"gsyncd/internal/scanstate"
 	"gsyncd/internal/status"
 	syncpkg "gsyncd/internal/sync"
+	"gsyncd/internal/verify"
 	"gsyncd/internal/watcher"
 )
 
@@ -42,19 +44,23 @@ func main() {
 }
 
 type flags struct {
-	configPath string
-	logFile    string
-	logLevel   string
-	pidFile    string
-	statusFile string
-	nodaemon   bool
-	once       bool
-	showStatus string
-	check      bool
-	initTarget bool
-	watchEvery time.Duration
-	fullResync time.Duration
-	printVer   bool
+	configPath    string
+	logFile       string
+	logLevel      string
+	pidFile       string
+	statusFile    string
+	nodaemon      bool
+	once          bool
+	showStatus    string
+	check         bool
+	initTarget    bool
+	verifyTree    bool
+	verifyContent bool
+	verifySample  int
+	verifyWorkers int
+	watchEvery    time.Duration
+	fullResync    time.Duration
+	printVer      bool
 }
 
 func parseFlags(args []string) (flags, error) {
@@ -70,6 +76,10 @@ func parseFlags(args []string) (flags, error) {
 	fs.StringVar(&f.showStatus, "status", "", "print the status file at PATH and exit")
 	fs.BoolVar(&f.check, "check", false, "validate the configuration and exit")
 	fs.BoolVar(&f.initTarget, "init-target", false, "write the .gsyncd-target marker into every local target and exit (the target must already exist)")
+	fs.BoolVar(&f.verifyTree, "verify-tree", false, "compare the source and target directory trees and exit")
+	fs.BoolVar(&f.verifyContent, "verify-content", false, "hash every selected source/target file and compare it (expensive) and exit")
+	fs.IntVar(&f.verifySample, "verify-sample", 0, "with -verify-content: hash this percentage of files (0 or 100 = all)")
+	fs.IntVar(&f.verifyWorkers, "verify-workers", 0, "with -verify-content: concurrent hashers (0 = default)")
 	fs.DurationVar(&f.watchEvery, "watch-interval", 0, "poll interval for the portable backend (0 = default)")
 	fs.DurationVar(&f.fullResync, "full-resync", -1, "periodic full resync interval (-1 = use the config)")
 	fs.BoolVar(&f.printVer, "version", false, "print the version and exit")
@@ -138,6 +148,9 @@ func run() error {
 			fmt.Printf("initialised target %s\n", s.Target)
 		}
 		return nil
+	}
+	if f.verifyTree || f.verifyContent {
+		return runVerify(cfg, f.verifyTree, f.verifyContent, f.verifySample, f.verifyWorkers)
 	}
 	if f.check {
 		if cfg.Global.TargetGuard {
@@ -471,6 +484,68 @@ func maxHold(d time.Duration) time.Duration {
 	return d
 }
 
+// runVerify implements -verify-tree and -verify-content. Both are read-only:
+// they never write to the target and never need the guard marker.
+func runVerify(cfg config.Config, structural, content bool, sample, workers int) error {
+	if sample < 0 {
+		sample = 0
+	}
+	if sample > 100 {
+		sample = 100
+	}
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+		if workers > 16 {
+			workers = 16
+		}
+	}
+	bad := 0
+	for i := range cfg.Syncs {
+		s := &cfg.Syncs[i]
+		if !localTarget(*s) {
+			fmt.Printf("[%s] skipped: remote target\n", s.Name)
+			continue
+		}
+		flt := filter.New(s.Excludes)
+		ignore := func(rel string, dir bool) bool { return flt.Match(rel, dir) }
+		if structural {
+			res, err := verify.Tree(s.Source, s.Target, verify.Options{Ignore: ignore})
+			if err != nil {
+				return fmt.Errorf("[%s] verify-tree: %w", s.Name, err)
+			}
+			fmt.Printf("[%s] tree checked=%d missing=%d extra=%d type_mismatch=%d\n",
+				s.Name, res.Checked, res.Missing, res.Extra, res.TypeMismatch)
+			for _, line := range res.Samples {
+				fmt.Printf("  %s\n", line)
+			}
+			if !res.OK() {
+				bad++
+			}
+		}
+		if content {
+			res, err := verify.Content(s.Source, s.Target, verify.ContentOptions{
+				Ignore: ignore, Workers: workers, SamplePercent: sample,
+			})
+			if err != nil {
+				return fmt.Errorf("[%s] verify-content: %w", s.Name, err)
+			}
+			fmt.Printf("[%s] content checked=%d missing=%d type_mismatch=%d hash_mismatch=%d mtime_mismatch=%d\n",
+				s.Name, res.Checked, res.Missing, res.TypeMismatch, res.Mismatch, res.MtimeMismatch)
+			for _, line := range res.Samples {
+				fmt.Printf("  %s\n", line)
+			}
+			if !res.OK() {
+				bad++
+			}
+		}
+	}
+	if bad > 0 {
+		return fmt.Errorf("verification found differences in %d sync(s)", bad)
+	}
+	fmt.Println("verification OK")
+	return nil
+}
+
 // localTarget reports whether the target is a filesystem path this process can
 // stat. rsyncssh and rsync's host:path form name a remote endpoint instead.
 func localTarget(s config.Sync) bool {
@@ -504,6 +579,8 @@ func buildBackend(s *config.Sync, g config.Global, logger *logx.Logger, flt *fil
 		d.Fsync = s.Fsync
 		d.Prefetch = s.Prefetch
 		d.TargetGuard = g.TargetGuard
+		d.Verify = s.Verify
+		d.VerifyRetries = s.VerifyRetries
 		if !flt.Empty() {
 			d.Ignore = flt.Match
 		}

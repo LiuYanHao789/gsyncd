@@ -83,6 +83,10 @@ gsyncd/
 | `-status PATH` | 打印状态文件并退出 |
 | `-check` | 校验配置（含源目录、目标守卫）后退出 |
 | `-init-target` | 向每个本地目标写入 `.gsyncd-target` marker 后退出；目标必须已存在（用于目标守卫的首次初始化） |
+| `-verify-tree` | 只读对比源与目标的目录树和文件集合（目标端只 readdir），有差异时退出码非 0 |
+| `-verify-content` | 只读对比源与目标所有（或抽样）文件的 SHA-256，有差异时退出码非 0；代价是完整读一遍两侧 |
+| `-verify-sample N` | 配合 `-verify-content`：按路径确定性抽取 N% 文件；0 或 100 表示全部 |
+| `-verify-workers N` | 配合 `-verify-content`：并发哈希数；0 表示 `min(CPU,16)` |
 | `-watch-interval D` | 可移植轮询后端的扫描间隔（如 `30s`） |
 | `-full-resync D` | 周期性全量重同步间隔；`-1`（默认）表示沿用配置，不覆盖 |
 | `-version` | 打印版本 |
@@ -148,6 +152,8 @@ nice 值是**逐个线程**设的（`setpriority` 在 Linux 上只影响调用�
 | `prefetch` | int | 0(=`min(CPU,16)`) | `direct` 模式初始遍历时**预读目录列表**的 goroutine 数。冷缓存下串行遍历只有一次元数据请求在飞，磁盘队列是空的：21 万目录实测 126s（串行）vs 15.9s（16 路）。**不改变访问顺序**，所以检查点仍然有效；负数关闭预读，退回 `filepath.Walk` |
 | `batch_limit` | int | `10000` | 单次 rsync 调用的最大路径数 |
 | `fsync` | bool | `false` | `direct` 模式下每个文件在 `rename` 前都 `fsync`。默认关闭：8 MiB 以上的文件无论如何都会刷盘，而对百万小文件逐个 `fsync` 比拷贝本身还慢 |
+| `verify` | bool | `true` | `direct` 模式下传输时内容校验：边拷边算 SHA-256，落盘前读回暂存文件重算并比较；不一致自动重拷。代价是每个拷贝文件多读一遍。`-verify-content` 是全量/抽样深校验 |
+| `verify_retries` | int | `2` | 内容校验失败后的额外重拷次数；仍失败则批次报错并按路径记录 |
 | `checkpoint` | string | `""`（关闭） | `direct` 模式的断点续扫记录文件。`"auto"` 落在 `status_file`/`log_file`/`pid_file` 同目录（都没有则 `$TMPDIR`），也可以写绝对路径。见下文「断点续扫」 |
 
 `[sync.ssh]` 子表（仅 `rsyncssh`）：`binary`、`port`、`identity_file`、`options`（map）。
@@ -338,6 +344,16 @@ scan state: 1000001 directories verified, 1000001 reused, 0 recorded, 0 dropped
 `verified` 是本次走到的目录数，`reused` 是其中直接跳过的，`dropped` 是因为记录缓冲满而没写下的（下次多验证几个，安全方向）。可以随时删掉检查点文件，下一次启动就是一次完整核对。
 
 > 只有 `direct` 模式有检查点。`rsync` / `rsyncssh` 的跳过判断在 rsync 自己手里（`--size-only` 或默认的 size+mtime），gsyncd 不重复做。
+
+## 校验
+
+正确性判定是：目录树结构、文件存在性、文件内容、文件大小、mtime 一致。`size+mtime` 只用于增量扫描，不作为最终一致证据。
+
+- **传输时校验（默认开，`verify = true`）**：`direct` 后端边拷边算源文件的 SHA-256，`rename` 前读回暂存文件重算；不一致删掉暂存、重拷（`verify_retries` 次），仍失败则批次报错并记录路径。旧目标在 `rename` 前不被改动，校验失败不会破坏已有正确副本。
+- **目录树完整性**：`gsyncd -config ... -verify-tree`；目标端只 `readdir`，按目录比对名字/类型，报告缺失、多余、类型不一致。适合首传/全量后每天跑一次。
+- **内容深校验**：`gsyncd -config ... -verify-content`（可配 `-verify-sample N`、`-verify-workers N`）。两侧都完整读一遍；1TB 本地盘约数十分钟到数小时，100TB 级是数天到数周，默认不自动跑，建议用 cron/systemd timer 低频执行。
+- **读回缓存说明**：默认模式验证的是“通过该挂载点读到的内容”；同一 NFS 客户端的缓存可能让读回不落到服务端磁盘。需要更强保证时，把目标挂载为 `sync` 或在维护窗口直接对服务端做校验。
+- `rsync`/`rsyncssh` 后端依赖 rsync 自身的滚动块校验；`-verify-tree`/`-verify-content` 对本地/NFS 挂载目标同样适用，对纯 ssh 远端需要目标端可达。
 
 ## 从 lsyncd 迁移
 
