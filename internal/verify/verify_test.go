@@ -144,3 +144,32 @@ func TestContentSampleIsDeterministic(t *testing.T) {
 		t.Fatalf("sample checked %d of 50", res.Checked)
 	}
 }
+
+func TestContentCoarseTimestampGranularity(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	write(t, filepath.Join(src, "a"), "same")
+	write(t, filepath.Join(dst, "a"), "same")
+	// Same second, different sub-second value: a coarse target cannot store
+	// the difference, so it must not be reported.
+	base := time.Unix(1700000000, 100_000_000)
+	if err := os.Chtimes(filepath.Join(src, "a"), base, base); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(dst, "a"), base, base.Add(800*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Content(src, dst, ContentOptions{Workers: 1, MtimeGranularity: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.MtimeMismatch != 0 {
+		t.Fatalf("coarse granularity still reported mtime mismatch: %+v", res)
+	}
+	res, err = Content(src, dst, ContentOptions{Workers: 1, MtimeGranularity: time.Nanosecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.MtimeMismatch != 1 {
+		t.Fatalf("nanosecond granularity missed mtime mismatch: %+v", res)
+	}
+}

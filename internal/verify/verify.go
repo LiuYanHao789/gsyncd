@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Result is the outcome of one comparison.
@@ -208,6 +209,10 @@ type ContentOptions struct {
 	// deterministically by path. Zero or 100 means every file.
 	SamplePercent int
 	SampleLimit   int
+	// MtimeGranularity is the target filesystem's timestamp resolution. Zero
+	// probes it (one tiny temporary file on the target); a filesystem that
+	// stores only whole seconds then compares mtimes at second resolution.
+	MtimeGranularity time.Duration
 }
 
 // Content hashes every selected regular file on both sides and reports
@@ -220,6 +225,10 @@ func Content(source, target string, opts ContentOptions) (Result, error) {
 	}
 	if opts.Workers <= 0 {
 		opts.Workers = 4
+	}
+	gran := opts.MtimeGranularity
+	if gran == 0 {
+		gran = probeGranularity(target)
 	}
 	type job struct{ rel, src string }
 	jobs := make(chan job, opts.Workers*4)
@@ -298,7 +307,7 @@ func Content(source, target string, opts ContentOptions) (Result, error) {
 				if sh != dh {
 					r.Mismatch++
 					r.sample("hash: "+j.rel+" source="+sh+" target="+dh, opts.SampleLimit)
-				} else if srcInfo.ModTime().UnixNano() != dstInfo.ModTime().UnixNano() {
+				} else if truncateNanos(srcInfo.ModTime().UnixNano(), gran) != truncateNanos(dstInfo.ModTime().UnixNano(), gran) {
 					r.MtimeMismatch++
 					r.sample("mtime: "+j.rel, opts.SampleLimit)
 				}
@@ -360,6 +369,54 @@ func kindOf(info os.FileInfo) string {
 	default:
 		return "special"
 	}
+}
+
+// probeGranularity measures the target's timestamp resolution by setting a
+// known nanosecond value on one temporary file. A target that cannot be
+// written falls back to exact comparison.
+func probeGranularity(dir string) time.Duration {
+	// The probe file changes the directory mtime; restore it so a later
+	// daemon start still sees the checkpoint evidence it had before.
+	pre, _ := os.Stat(dir)
+	f, err := os.CreateTemp(dir, ".gsyncd-mtime-*")
+	if err != nil {
+		return 0
+	}
+	name := f.Name()
+	_ = f.Close()
+	defer func() {
+		_ = os.Remove(name)
+		if pre != nil {
+			_ = os.Chtimes(dir, pre.ModTime(), pre.ModTime())
+		}
+	}()
+	want := time.Unix(1700000000, 123456789)
+	if err := os.Chtimes(name, want, want); err != nil {
+		return 0
+	}
+	st, err := os.Stat(name)
+	if err != nil {
+		return 0
+	}
+	ns := st.ModTime().Nanosecond()
+	switch {
+	case ns == 0:
+		return time.Second
+	case ns%1_000_000 == 0:
+		return time.Millisecond
+	case ns%1_000 == 0:
+		return time.Microsecond
+	default:
+		return time.Nanosecond
+	}
+}
+
+func truncateNanos(ns int64, gran time.Duration) int64 {
+	if gran <= 0 {
+		return ns
+	}
+	g := int64(gran)
+	return ns / g * g
 }
 
 func hashFile(path string, buf []byte) (string, error) {

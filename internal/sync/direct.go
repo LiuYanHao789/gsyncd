@@ -69,6 +69,10 @@ type Direct struct {
 	// was moved, unmounted or replaced while the daemon ran must not silently
 	// turn into a new directory that gsyncd then fills.
 	targetInfo os.FileInfo
+	// mtimeGran is the target filesystem's timestamp resolution, measured once
+	// at Startup. It keeps skip/checkpoint comparisons meaningful on targets
+	// that cannot store nanoseconds.
+	mtimeGran time.Duration
 	// Logf receives diagnostics.
 	Logf func(level string, format string, args ...any)
 
@@ -177,6 +181,7 @@ func (d *Direct) Startup(ctx context.Context) error {
 		}
 		d.targetInfo = st
 	}
+	d.mtimeGran = probeMtimeGranularity(d.Target)
 	d.pruned = 0
 	d.freshTarget = targetIsEmpty(d.Target)
 	defer func() { d.freshTarget = false }()
@@ -857,7 +862,7 @@ func (d *Direct) walkCopy(ctx context.Context) error {
 				if base, ok := d.scan.Lookup(rel); ok {
 					checked++
 					if st, serr := os.Stat(dir); serr == nil && st.IsDir() &&
-						st.ModTime().UnixNano() == base.Mtime {
+						st.ModTime().UnixNano() == truncateMtimeNanos(base.Mtime, d.mtimeGran) {
 						fr.hold = true
 						fr.base = base
 					}
@@ -977,7 +982,7 @@ func (d *Direct) copyFileAt(ctx context.Context, rel string, info os.FileInfo) e
 	// Skip when the destination is already identical (size and mtime). On a
 	// fresh target nothing can match, so the stat is skipped entirely.
 	if !d.freshTarget {
-		if st, err := os.Stat(dst); err == nil && st.Size() == info.Size() && st.ModTime().Equal(info.ModTime()) {
+		if st, err := os.Stat(dst); err == nil && st.Size() == info.Size() && st.ModTime().UnixNano() == truncateMtimeNanos(info.ModTime().UnixNano(), d.mtimeGran) {
 			return nil
 		}
 	}
@@ -1560,7 +1565,7 @@ func (d *Direct) applyOne(ctx context.Context, c aggregate.Change) error {
 	// stat is only a hint for the case where nothing but attributes moved.
 	if c.Op&(event.Write|event.Create) == 0 {
 		if st, serr := os.Stat(dst); serr == nil && st.Size() == info.Size() &&
-			st.ModTime().Equal(info.ModTime()) && st.Mode().Perm() == info.Mode().Perm() {
+			st.ModTime().UnixNano() == truncateMtimeNanos(info.ModTime().UnixNano(), d.mtimeGran) && st.Mode().Perm() == info.Mode().Perm() {
 			return nil
 		}
 	}
