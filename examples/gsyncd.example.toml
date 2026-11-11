@@ -103,9 +103,15 @@ target = "/backup/data"
 # 事件静默多久后开始传输。整数按秒解释。
 delay = 15
 
+# delay 的语义：
+#   "quiet"    —— 整棵树静默 delay 后刷（默认，避免拷贝半写文件）
+#   "deadline" —— 最早一条待处理事件满 delay 即刷（与 lsyncd 一致，
+#                 适合持续写入、不能等静默的树）
+delay_mode = "quiet"
+
 # 持续写入（日志/WAL/大文件）导致永不静默时，最多等这么久强制刷一次。
-# 0 = 使用默认 1h；负值 = 关闭上限（不推荐，文件可能长期不同步）。
-max_hold = "1h"
+# 0 = 使用默认 15m；负值 = 关闭上限（不推荐，文件可能长期不同步）。
+max_hold = "15m"
 
 # 等待 writer 关闭文件后再同步（issue #458）。
 # 默认 false：写入期间可能落半截快照，close 后自愈。
@@ -130,6 +136,30 @@ excludes = [
   "tmp[0-9]",
   "!keep.tmp",
 ]
+
+# 额外的排除规则文件（每行一条，# 开头为注释）。相对路径按配置文件目录解析。
+# 文件中的规则排在内联 excludes 之前，内联的 !rule 可以再包含回来。
+# exclude_from = "/etc/gsyncd/excludes.txt"
+
+# direct 元数据保真：
+#   preserve_mode  = "full"（默认，保留 setuid/setgid/sticky）| "basic"
+#   preserve_owner = "auto"（默认，仅 root 时 chown）| true | false
+# 目录 mtime 始终保留；目标根目录本身不 chown/chmod。
+preserve_mode = "full"
+preserve_owner = "auto"
+
+# 符号链接策略：safe（默认，仅同步根内部链接）| all（原样复制）| skip。
+symlink_mode = "safe"
+
+# 高级保真（默认关闭，均尽力而为，失败只告警）：
+# preserve_xattrs    = false  # Linux xattr，含 POSIX ACL
+# preserve_hardlinks = false  # 单次初始扫描内重建硬链接
+# sparse             = false  # Linux 稀疏文件
+# copy_special       = false  # Linux FIFO/设备节点（设备节点需要 root）
+# bandwidth_limit    = 0      # direct 复制限速，字节/秒；0 = 不限
+
+# 本 sync 的周期全量重同步；0 = 继承全局 full_resync。
+# full_resync = "6h"
 
 # direct 后端并行拷贝 goroutine 数。0 = min(CPU,16)。
 workers = 0
@@ -172,7 +202,9 @@ max_processes = 0
 # delay = 15
 # delete = true
 # excludes = ["*.tmp", "/cache/"]
-# rsync_extra = ["-z"]
+# rsync_compress = true
+# rsync_extra = ["--numeric-ids"]
+# max_processes = 1      # rsyncssh 默认 1，建议保持
 # [sync.ssh]
 # binary = "ssh"
 # port = 22
@@ -192,3 +224,13 @@ max_processes = 0
 # delete = true
 # batch_limit = 10000
 # rsync_extra = ["--numeric-ids"]
+# rsync_binary = "rsync"
+# rsync_bwlimit = "50m"
+# rsync_xattrs = true
+# rsync_acls = true
+# rsync_hard_links = true
+# rsync_chown = "root:root"
+# rsync_chmod = "D755,F644"
+# rsync_password_file = "/etc/gsyncd/rsync.pass"
+# rsync_path = "/usr/bin/rsync"
+# rsync_delete_excluded = false

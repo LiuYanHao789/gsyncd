@@ -25,6 +25,10 @@ type Change struct {
 	Path string
 	// From is the old path for a pure rename.
 	From string
+	// PrevFrom holds earlier rename sources folded into the same entry (for
+	// example two renames onto one destination inside one window). Every one
+	// of them has to disappear from the target as well.
+	PrevFrom []string
 	Op   event.Op
 	Kind Kind
 	// At is the first time this path was touched in the window.
@@ -35,6 +39,12 @@ type Change struct {
 	// survive in the mirror, because a recreated directory carries no implied
 	// removal of its old contents.
 	Recreate bool
+
+	// Subtree marks a directory Create that must copy the whole source
+	// subtree. It is set by the engine when a rename crosses a filter
+	// boundary, where only one side is excluded and the destination has to be
+	// treated as new content rather than as a rename of the target copy.
+	Subtree bool
 
 	// open records whether the newest thing that happened to this path was a
 	// write whose writer has not closed the file yet. It is not derivable
@@ -184,7 +194,7 @@ func (a *Aggregator) Add(ev event.Event) {
 	if ev.IsDir {
 		kind = KindDir
 	}
-	a.upsert(Change{Path: ev.Path, Op: ev.Op, Kind: kind, At: ev.At})
+	a.upsert(Change{Path: ev.Path, Op: ev.Op, Kind: kind, At: ev.At, Subtree: ev.Subtree})
 }
 
 // upsert merges a change into the existing entry for the same path.
@@ -234,6 +244,36 @@ func (a *Aggregator) upsertKnown(c Change, keepOpen bool) {
 		old.Op = merged
 		if c.Kind == KindDir {
 			old.Kind = KindDir
+		}
+		// A subtree copy is never weakened by a later event: once the window
+		// decided that a directory has to be mirrored wholesale, folding in a
+		// plain Create must not reduce that to "create the entry only".
+		if c.Subtree {
+			old.Subtree = true
+		}
+		if c.Recreate {
+			old.Recreate = true
+		}
+		if c.From != "" {
+			if keepOpen {
+				// This is a failed batch being re-added: it predates anything
+				// already in the window, so it must not clear a newer Delete.
+				// Its old name still has to be cleaned up.
+				if old.From == "" {
+					old.From = c.From
+				} else if old.From != c.From {
+					old.PrevFrom = appendFrom(old.PrevFrom, c.From)
+				}
+			} else {
+				// A newer move landing on this path means it exists in the
+				// final state, so a pending Delete is superseded. Earlier
+				// rename sources have to be deleted too.
+				old.Op &^= event.Delete
+				if old.From != "" && old.From != c.From {
+					old.PrevFrom = appendFrom(old.PrevFrom, old.From)
+				}
+				old.From = c.From
+			}
 		}
 		if c.At.Before(old.At) {
 			old.At = c.At
@@ -407,10 +447,21 @@ func (a *Aggregator) applyMove(ev event.Event) {
 	// target rename would move the old, stale copy to the new name and the
 	// write would never reach the mirror.
 	var carried event.Op
+	// recreate survives a rename too: a directory that was deleted and
+	// recreated before being moved must not be applied as a rename of the old
+	// target copy, which still holds the deleted children.
+	var recreate bool
 	if ev.IsDir {
+		// A directory's pending Attrib/Create change has to survive the
+		// rename. followRename removes the old entry, so capture it first.
+		if i, ok := a.index[ev.From]; ok {
+			carried = a.items[i].Op & (event.Attrib | event.Create)
+			recreate = a.items[i].Recreate
+		}
 		a.followRename(ev.From, ev.Path)
 	} else if i, ok := a.index[ev.From]; ok {
 		carried = a.items[i].Op & (event.Create | event.Write | event.Attrib)
+		recreate = a.items[i].Recreate
 		wasOpen = a.items[i].open
 		a.removeAt(i)
 	}
@@ -425,7 +476,7 @@ func (a *Aggregator) applyMove(ev event.Event) {
 		a.upsert(Change{Path: ev.Path, Op: event.Create | carried, Kind: kind, At: ev.At, open: wasOpen})
 		return
 	}
-	a.upsert(Change{Path: ev.Path, From: ev.From, Op: event.Move | carried, Kind: kind, At: ev.At, open: wasOpen})
+	a.upsert(Change{Path: ev.Path, From: ev.From, Op: event.Move | carried, Kind: kind, At: ev.At, Recreate: recreate, open: wasOpen})
 }
 
 // followRename moves pending children of a renamed directory to their new
@@ -466,6 +517,16 @@ func (a *Aggregator) followRename(from, to string) {
 	for _, c := range retarget {
 		a.upsert(c)
 	}
+}
+
+// appendFrom adds p once, preserving the order earlier renames were seen.
+func appendFrom(list []string, p string) []string {
+	for _, x := range list {
+		if x == p {
+			return list
+		}
+	}
+	return append(list, p)
 }
 
 // underPath reports whether p is root itself or lives below it.

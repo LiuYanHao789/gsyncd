@@ -65,6 +65,15 @@ type Spec struct {
 	// MaxHold must stay enabled with it: it is the only progress guarantee
 	// left for a writer that never closes.
 	CloseWrite bool
+	// DelayMode selects what Delay means. "quiet" (the default and the empty
+	// value) waits until no event has arrived for Delay; "deadline" flushes
+	// when the oldest pending change is Delay old, which is what lsyncd does
+	// and what keeps a continuously written tree converging every Delay
+	// instead of waiting for MaxHold.
+	DelayMode string
+	// FullResync overrides the engine-wide periodic full resync for this
+	// sync. Zero inherits the global value set by SetFullResync.
+	FullResync time.Duration
 	// Retries is how often a failing batch is attempted before it is put back
 	// into the window for the next round.
 	Retries int
@@ -127,7 +136,11 @@ type Root struct {
 	mu        sync.Mutex
 	lastEvent time.Time
 	flushing  bool
-	pending   bool
+	// starting is true while the initial backend Startup is running. A
+	// Reattach or Tick during those hours must queue a flush, not launch a
+	// second Direct.Startup against the same checkpoint store and target.
+	starting bool
+	pending  bool
 	// retryAt gates the next attempt after a failed round, and fails counts
 	// the consecutive failures that set it. Without the gate a target that is
 	// down would be retried as fast as the delay allows - and a failed *full*
@@ -144,6 +157,10 @@ type Root struct {
 	// limit is the per-sync transfer semaphore, nil when the sync inherits the
 	// global one.
 	limit chan struct{}
+	// nextFull is the next periodic full resync for this root. A root with
+	// its own FullResync follows that interval; a zero value inherits the
+	// engine-wide one and is recomputed when the global interval changes.
+	nextFull time.Time
 }
 
 // statsSource is implemented by backends that can report what they wrote.
@@ -191,7 +208,6 @@ type Engine struct {
 	// nanoseconds. Zero disables it. Stored atomically because the caller may
 	// set it after the engine started running.
 	fullEvery int64
-	nextFull  time.Time
 }
 
 // SetFullResync schedules a periodic wholesale resynchronisation of every
@@ -205,6 +221,16 @@ func (e *Engine) SetFullResync(d time.Duration) {
 		d = 0
 	}
 	atomic.StoreInt64(&e.fullEvery, int64(d))
+	// A root that inherits the global interval must not keep the next firing
+	// time computed from the previous one; a root with its own full_resync is
+	// unaffected.
+	for _, r := range e.roots {
+		if r.FullResync <= 0 {
+			r.mu.Lock()
+			r.nextFull = time.Time{}
+			r.mu.Unlock()
+		}
+	}
 }
 
 // FullResync returns the configured interval, for the status file.
@@ -218,10 +244,13 @@ func (e *Engine) FullResync() time.Duration {
 // It has to be long enough that ordinary bursts of writes to one file - a
 // multi-gigabyte copy in progress, a database checkpoint - do not turn into
 // repeated full copies of that file, and short enough that a mirror of a busy
-// append-only log converges within a shift. An hour satisfies both: a file
-// written continuously costs at most one copy per hour, and one that merely
-// takes twenty minutes to upload is copied once, when it stops.
-const DefaultMaxHold = time.Hour
+// append-only log converges within an operationally useful window. Fifteen
+// minutes is the compromise: a continuously written file costs at most four
+// copies per hour, and a file that merely takes twenty minutes to upload is
+// copied once when it stops. The original lsyncd flushes a busy file every
+// delay (15s by default), which is far more aggressive; delay_mode="deadline"
+// restores that behaviour for users who want it.
+const DefaultMaxHold = 15 * time.Minute
 
 // New builds an engine.
 func New(specs []Spec, opts Options) (*Engine, error) {
@@ -327,6 +356,22 @@ func (e *Engine) Startup(ctx context.Context) error {
 		wg.Add(1)
 		go func(i int, r *Root) {
 			defer wg.Done()
+			// Mark the root as starting before taking a transfer slot, so a
+			// Reattach or Tick that arrives while we wait queues a flush
+			// instead of launching a second backend Startup.
+			r.mu.Lock()
+			r.starting = true
+			r.mu.Unlock()
+			defer func() {
+				r.mu.Lock()
+				r.starting = false
+				again := r.pending
+				r.pending = false
+				r.mu.Unlock()
+				if again && ctx.Err() == nil {
+					e.flushAsync(r)
+				}
+			}()
 			if !e.acquire(ctx, r) {
 				errs[i] = ctx.Err()
 				return
@@ -473,17 +518,40 @@ func (e *Engine) Handle(ev event.Event) {
 	// Split it into a delete here and a create there.
 	if ev.Op&event.Move != 0 && ev.From != "" && !watcher.IsUnder(r.Source, ev.Path) {
 		e.Handle(event.Event{Path: ev.From, Op: event.Delete, IsDir: ev.IsDir, At: ev.At})
-		e.Handle(event.Event{Path: ev.Path, Op: event.Create, IsDir: ev.IsDir, At: ev.At})
+		// The destination may be another sync root whose watcher saw nothing
+		// of this move, so a directory has to be copied wholesale.
+		e.Handle(event.Event{Path: ev.Path, Op: event.Create, IsDir: ev.IsDir, Subtree: ev.IsDir, At: ev.At})
 		return
 	}
 	if r.Filter != nil {
 		dir := ev.IsDir
 		if ev.Op&event.Move != 0 && ev.From != "" {
-			// A move is interesting if either side is interesting.
-			inFrom := r.Filter.Match(relPath(r.Source, ev.From), true)
+			// A move has two sides and each is filtered on its own. Treating
+			// the pair as a unit is wrong in both half-excluded cases: a file
+			// moved out of an excluded directory would be carried onto the
+			// target by a rename of the old target copy, and a file moved into
+			// an excluded directory would be recreated there. The original
+			// lsyncd splits these into Create/Delete for exactly this reason.
+			inFrom := r.Filter.Match(relPath(r.Source, ev.From), dir)
 			inTo := r.Filter.Match(relPath(r.Source, ev.Path), dir)
-			if inFrom && inTo {
+			switch {
+			case inFrom && inTo:
 				e.bump(r, func(s *Stats) { s.Filtered++ })
+				return
+			case inFrom && !inTo:
+				// Source excluded, destination not: from the mirror's point
+				// of view a new file (or a whole directory) appeared.
+				e.store(r, event.Event{
+					Path: ev.Path, Op: event.Create, IsDir: dir,
+					Subtree: dir, At: ev.At,
+				})
+				return
+			case !inFrom && inTo:
+				// Destination excluded, source not: the mirror only sees the
+				// old name disappear.
+				e.store(r, event.Event{
+					Path: ev.From, Op: event.Delete, IsDir: dir, At: ev.At,
+				})
 				return
 			}
 		} else if r.Filter.Match(relPath(r.Source, subject), dir) {
@@ -491,6 +559,15 @@ func (e *Engine) Handle(ev event.Event) {
 			return
 		}
 	}
+	e.store(r, ev)
+}
+
+// store adds an event to the aggregation window and updates the counters.
+//
+// Synthetic events produced by the filter split go through here as well, so
+// they are visible in the same counters and reset the quiet window the same
+// way a kernel event does.
+func (e *Engine) store(r *Root, ev event.Event) {
 	r.agg.Add(ev)
 	r.mu.Lock()
 	r.lastEvent = e.now()
@@ -562,17 +639,26 @@ func (r *Root) ready(now, last time.Time) bool {
 	if r.agg.Overflowed() || r.agg.Urgent() || r.agg.Overdue(now, r.MaxHold) {
 		return true
 	}
-	return r.quiet(now, last)
+	return r.delayElapsed(now, last)
 }
 
-// quiet reports whether the tree has been quiet for the delay and, when
+// delayElapsed reports whether the configured delay has elapsed and, when
 // close_write is on, whether every pending file has been closed.
 //
-// Delay still means "quiet for this long": a close restarts the clock rather
-// than flushing at once, so a writer that touches a file again a moment later
-// is still folded into the same batch.
-func (r *Root) quiet(now, last time.Time) bool {
-	if now.Sub(last) < r.Delay {
+// "quiet" means no event has arrived for Delay; a close restarts the clock
+// rather than flushing at once, so a writer that touches a file again a moment
+// later is still folded into the same batch. "deadline" means the oldest
+// pending change has waited Delay, which keeps a continuously written tree
+// converging instead of resetting the clock forever.
+func (r *Root) delayElapsed(now, last time.Time) bool {
+	if r.DelayMode == "deadline" {
+		// A zero delay means "flush immediately"; Overdue treats a non
+		// positive bound as disabled, which is right for max_hold but wrong
+		// here.
+		if r.Delay > 0 && !r.agg.Overdue(now, r.Delay) {
+			return false
+		}
+	} else if now.Sub(last) < r.Delay {
 		return false
 	}
 	if r.CloseWrite && r.agg.OpenFiles() > 0 {
@@ -596,22 +682,30 @@ func (r *Root) gateOpen(now time.Time) bool {
 // maybeFullResync turns the periodic safety net into one overflow flag per
 // root, which the normal flush path then handles as a full transfer.
 func (e *Engine) maybeFullResync(now time.Time) {
-	d := e.FullResync()
-	if d <= 0 {
-		return
-	}
-	if e.nextFull.IsZero() {
-		e.nextFull = now.Add(d)
-		return
-	}
-	if now.Before(e.nextFull) {
-		return
-	}
-	e.nextFull = now.Add(d)
+	global := e.FullResync()
 	for _, r := range e.roots {
+		d := r.FullResync
+		if d <= 0 {
+			d = global
+		}
+		if d <= 0 {
+			continue
+		}
+		r.mu.Lock()
+		if r.nextFull.IsZero() {
+			r.nextFull = now.Add(d)
+			r.mu.Unlock()
+			continue
+		}
+		if now.Before(r.nextFull) {
+			r.mu.Unlock()
+			continue
+		}
+		r.nextFull = now.Add(d)
+		r.mu.Unlock()
 		r.agg.MarkOverflow()
+		e.log.Infof("[%s] periodic full resync", r.Name)
 	}
-	e.log.Infof("periodic full resync of %d sync(s)", len(e.roots))
 }
 
 // FlushAll synchronously drains every window. Used by tests and on shutdown.
@@ -627,7 +721,7 @@ func (e *Engine) flushSync(ctx context.Context, r *Root) {
 	// is exactly the shutdown case), so wait for the flag instead of racing it.
 	for {
 		r.mu.Lock()
-		if !r.flushing {
+		if !r.flushing && !r.starting {
 			r.flushing = true
 			r.mu.Unlock()
 			break
@@ -649,6 +743,13 @@ func (e *Engine) flushSync(ctx context.Context, r *Root) {
 // flushAsync starts a transfer in the background, respecting the process cap.
 func (e *Engine) flushAsync(r *Root) {
 	r.mu.Lock()
+	if r.starting {
+		// The initial pass owns the backend and the checkpoint store. Queue
+		// one flush; Startup clears the flag and starts it when it finishes.
+		r.pending = true
+		r.mu.Unlock()
+		return
+	}
 	if r.flushing {
 		r.pending = true
 		r.mu.Unlock()
@@ -684,8 +785,13 @@ func (e *Engine) flushAsync(r *Root) {
 		// has it: a batch that failed during an overflow marks the window
 		// overflowed again, and flushing on that here would retry in a tight
 		// loop, bypassing the retry gate that apply just armed.
-		if now := e.now(); again && r.agg.Len() > 0 &&
-			(r.agg.Urgent() || r.agg.Overdue(now, r.MaxHold) || r.quiet(now, last)) {
+		// gateOpen is checked here as well as in Tick. In deadline mode the
+		// readded changes keep their original timestamps, so delayElapsed is
+		// immediately true after a failed batch; without the gate the
+		// background chain would retry a down target every few seconds and
+		// bypass the backoff apply() just armed.
+		if now := e.now(); again && r.agg.Len() > 0 && r.gateOpen(now) &&
+			(r.agg.Urgent() || r.agg.Overdue(now, r.MaxHold) || r.delayElapsed(now, last)) {
 			e.flushAsync(r)
 		}
 	}()

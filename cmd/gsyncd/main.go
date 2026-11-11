@@ -12,13 +12,12 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
-	"syscall"
+	"sync/atomic"
 	"time"
 
 	"gsyncd/internal/config"
@@ -34,9 +33,15 @@ import (
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
-var version = "0.2.0"
+var version = "0.4.0"
+
+// envReloaded marks the process that replaced itself for a SIGHUP reload. It
+// must not daemonize again: it already has the right session and pid, and a
+// second detach would orphan the pid file.
+const envReloaded = "GSYNCD_RELOADED"
 
 func main() {
+	ignoreReloadSignalUntilReady()
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "gsyncd: %v\n", err)
 		os.Exit(1)
@@ -132,7 +137,33 @@ func run() error {
 		cfg.Global.WatchInterval = f.watchEvery
 	}
 	if f.fullResync >= 0 {
+		// The command line is an explicit operator decision, so it wins over
+		// every per-sync full_resync as well.
 		cfg.Global.FullResync = f.fullResync
+		for i := range cfg.Syncs {
+			cfg.Syncs[i].FullResync = 0
+		}
+	}
+	// Options whose backend exists only on Linux must fail here, not turn into
+	// a silent no-op that reports every entry as copied.
+	for i := range cfg.Syncs {
+		s := &cfg.Syncs[i]
+		// These two keys are direct-backend options. A rsync/rsyncssh sync
+		// ignores them, so they must not make an otherwise valid config fail
+		// on a platform where the selected backend does work.
+		if s.Mode != config.ModeDirect {
+			continue
+		}
+		if s.PreserveXattrs {
+			if err := requireLinuxFeature("preserve_xattrs"); err != nil {
+				return fmt.Errorf("sync %q: %w", s.Name, err)
+			}
+		}
+		if s.CopySpecial {
+			if err := requireLinuxFeature("copy_special"); err != nil {
+				return fmt.Errorf("sync %q: %w", s.Name, err)
+			}
+		}
 	}
 	if f.initTarget {
 		// The target must already exist: creating it here would remove the
@@ -175,7 +206,7 @@ func run() error {
 	// what a service manager wants. A one-shot run is a command, not a daemon:
 	// detaching it would return the shell prompt while the copy is still
 	// running and hide its exit status.
-	if !cfg.Global.Nodaemon && !f.once {
+	if !cfg.Global.Nodaemon && !f.once && os.Getenv(envReloaded) == "" {
 		if !daemonSupported {
 			fmt.Fprintln(os.Stderr, "gsyncd: this platform cannot detach, running in the foreground")
 		} else if parent, derr := daemonize(cfg.Global.LogFile); derr != nil {
@@ -254,6 +285,8 @@ func run() error {
 			Retries:        3,
 			MaxProcesses:   s.MaxProcesses,
 			CloseWrite:     s.CloseWrite,
+			DelayMode:      s.DelayMode,
+			FullResync:     s.FullResync,
 		})
 		logger.Infof("[%s] mode=%s %s -> %s delay=%s delete=%v close_write=%v",
 			s.Name, s.Mode, s.Source, s.Target, s.Delay, s.Delete, s.CloseWrite)
@@ -278,6 +311,49 @@ func run() error {
 		logger.Infof("one-shot sync finished")
 		return nil
 	}
+
+	// Signals are installed before any watch is registered. Installing 220k
+	// watches takes minutes on a large tree, and the initial transfer takes
+	// hours; a SIGHUP in either phase must reload, not hit the kernel default
+	// disposition and terminate the daemon.
+	var reloading, stopping atomic.Bool
+	sig := make(chan os.Signal, 2)
+	notifySignals(sig)
+	go func() {
+		// Keep receiving. Returning after the first signal would leave the
+		// channel unread while signal.Notify keeps the default disposition
+		// disabled, so a later SIGTERM would be ignored and systemd would
+		// eventually SIGKILL a drain that is still in progress.
+		for s := range sig {
+			if isReloadSignal(s) {
+				if stopping.Load() {
+					continue
+				}
+				// Validate the new file before tearing the old process down.
+				// A typo must leave the running mirror untouched, not replace
+				// it with an image that exits on startup.
+				if _, err := config.Load(f.configPath); err != nil {
+					logger.Errorf("reload rejected, keeping the running configuration: %v", err)
+					continue
+				}
+				// SIGHUP asks for a configuration reload. Cancelling drains
+				// the engine through its normal shutdown path (in-flight
+				// batches finish, the last window is flushed), and main then
+				// re-executes itself with the same pid.
+				logger.Infof("SIGHUP received, reloading after draining")
+				reloading.Store(true)
+				cancel()
+				continue
+			}
+			// A TERM/INT during a reload cancels the restart: the operator
+			// asked to stop, not to come back with the new configuration.
+			if !stopping.Swap(true) {
+				logger.Infof("signal %s received, shutting down", s)
+			}
+			reloading.Store(false)
+			cancel()
+		}
+	}()
 
 	// Watch first, sync second: anything created while the initial transfer
 	// runs is still recorded, which closes the race the original had between
@@ -318,6 +394,12 @@ func run() error {
 	}
 
 	for _, s := range cfg.Syncs {
+		if ctx.Err() != nil {
+			// A reload or stop arrived while installing watches. Do not spend
+			// minutes finishing the rest of a tree that is about to be torn
+			// down; the next process installs them from the new config.
+			break
+		}
 		if err := tree.AddRoot(s.Source); err != nil {
 			return fmt.Errorf("watch %s: %w", s.Source, err)
 		}
@@ -357,17 +439,27 @@ func run() error {
 	}
 	ph.set(phaseRunning)
 
-	sig := make(chan os.Signal, 2)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sig
-		logger.Infof("signal received, shutting down")
-		cancel()
-	}()
-
 	logger.Infof("entering main loop")
 	err = eng.Run(ctx, tree.Events())
 	tree.Close()
+	if reloading.Load() && !stopping.Load() {
+		logger.Infof("reloading configuration")
+		// Stop the status writer before the image is replaced; buffered JSON
+		// would otherwise be lost. Stop and Flush are idempotent, so the
+		// deferred calls are harmless if Exec fails and this function returns
+		// normally.
+		if sw != nil {
+			sw.Stop()
+		}
+		// Flush, do not close: the image is about to be replaced and a
+		// draining goroutine may still log. Exec keeps the descriptor, and
+		// the deferred Close covers the Exec-failure path.
+		_ = logger.Flush()
+		if execErr := reExecSelf(); execErr != nil {
+			return fmt.Errorf("reload: %w", execErr)
+		}
+		return nil
+	}
 	if errors.Is(err, context.Canceled) {
 		logger.Infof("stopped")
 		return nil
@@ -553,7 +645,7 @@ func localTarget(s config.Sync) bool {
 	if s.Mode == config.ModeRsyncSSH {
 		return false
 	}
-	if s.Mode == config.ModeRsync && strings.Contains(s.Target, ":") {
+	if s.Mode == config.ModeRsync && s.Remote {
 		return false
 	}
 	return true
@@ -582,11 +674,30 @@ func buildBackend(s *config.Sync, g config.Global, logger *logx.Logger, flt *fil
 		d.TargetGuard = g.TargetGuard
 		d.Verify = s.Verify
 		d.VerifyRetries = s.VerifyRetries
+		d.PreserveOwner = s.PreserveOwner
+		d.FullMode = s.PreserveMode != "basic"
+		d.SymlinkMode = s.SymlinkMode
+		d.PreserveXattrs = s.PreserveXattrs
+		d.PreserveHardlinks = s.PreserveHardlinks
+		d.Sparse = s.Sparse
+		d.CopySpecial = s.CopySpecial
+		d.Bandwidth = s.BandwidthLimit
 		if !flt.Empty() {
 			d.Ignore = flt.Match
 		}
 		if cp := checkpointPath(s, g); cp != "" {
-			fp := scanstate.Fingerprint(s.Source, s.Target, s.Excludes, string(s.Mode))
+			// Every option that changes what ends up in the target belongs in
+			// the fingerprint. symlink_mode and copy_special change which
+			// entries exist at all; the metadata options change what a
+			// directory record is allowed to skip.
+			fp := scanstate.Fingerprint(s.Source, s.Target, s.Excludes,
+				string(s.Mode), s.SymlinkMode, s.PreserveMode, s.PreserveOwner,
+				strconv.FormatBool(s.PreserveXattrs),
+				strconv.FormatBool(s.PreserveHardlinks),
+				strconv.FormatBool(s.Sparse),
+				strconv.FormatBool(s.CopySpecial),
+				strconv.FormatBool(s.Delete), s.DeleteMode,
+			)
 			d.UseCheckpoint(scanstate.Open(cp, fp, logf))
 		}
 		return d, nil
@@ -597,14 +708,25 @@ func buildBackend(s *config.Sync, g config.Global, logger *logx.Logger, flt *fil
 		r.BatchLimit = s.BatchLimit
 		r.Excludes = s.Excludes
 		r.TargetGuard = g.TargetGuard
+		// mode = "rsync" can name a remote target just as rsyncssh does. The
+		// distinction decides whether a runtime delete is a local RemoveAll or
+		// a remote --delete-missing-args, so it must not be inferred again
+		// inside the backend.
+		r.Remote = s.Remote
+		applyRSyncOptions(r, s)
 		r.OnLine = func(line string) { logger.Debugf("[%s] rsync: %s", s.Name, line) }
 		return r, nil
 	case config.ModeRsyncSSH:
 		host := s.Target
 		dir := s.TargetDir
+		if s.MaxProcesses > 1 {
+			logger.Warnf("[%s] rsyncssh with max_processes=%d: concurrent remote moves and rsyncs against the same destination are not safe; use 1 unless you have verified the workload", s.Name, s.MaxProcesses)
+		}
 		r := syncpkg.NewRSync(s.Source, host, s.Delete, s.RSyncExtra, logf)
 		r.SSH = true
+		r.Remote = true
 		r.TargetDir = dir
+		applyRSyncOptions(r, s)
 		r.DeleteOnStartup = s.StartupDelete()
 		r.DeleteOnRun = s.RunningDelete()
 		r.BatchLimit = s.BatchLimit
@@ -621,6 +743,29 @@ func buildBackend(s *config.Sync, g config.Global, logger *logx.Logger, flt *fil
 		return r, nil
 	}
 	return nil, fmt.Errorf("unknown mode %q", s.Mode)
+}
+
+// applyRSyncOptions copies the structured rsync configuration into the
+// backend. It is shared by mode = "rsync" and mode = "rsyncssh" so the two
+// dialects cannot drift apart in which flags they honour.
+func applyRSyncOptions(r *syncpkg.RSync, s *config.Sync) {
+	r.Binary = s.RSyncBinary
+	r.BWLimit = s.RSyncBWLimit
+	if r.BWLimit == 0 {
+		// bandwidth_limit is the common key; rsync_bwlimit is the override for
+		// a sync that needs a different cap than its direct counterpart.
+		r.BWLimit = s.BandwidthLimit
+	}
+	r.Compress = s.RSyncCompress
+	r.Xattrs = s.RSyncXattrs
+	r.ACLs = s.RSyncACLs
+	r.HardLinks = s.RSyncHardLinks
+	r.Chown = s.RSyncChown
+	r.Chmod = s.RSyncChmod
+	r.PasswordFile = s.RSyncPasswordFile
+	r.RsyncPath = s.RSyncPath
+	r.DeleteExcluded = s.RSyncDeleteExcluded
+	r.SymlinkMode = s.SymlinkMode
 }
 
 // checkpointPath resolves the sync's checkpoint setting to a file path.
@@ -675,6 +820,19 @@ func buildStatus(eng *engine.Engine, tree *watcher.Tree, cfg config.Config, ph *
 	for _, r := range eng.Roots() {
 		st := r.Stats()
 		s := byName[r.Name]
+		fr := s.FullResync
+		if fr <= 0 {
+			fr = cfg.Global.FullResync
+		}
+		if fr <= 0 {
+			// The engine may have armed the automatic hourly fallback after
+			// the watch table filled up; the status file has to show that.
+			fr = eng.FullResync()
+		}
+		frText := ""
+		if fr > 0 {
+			frText = fr.String()
+		}
 		doc.Syncs = append(doc.Syncs, status.SyncState{
 			Name:       r.Name,
 			Source:     r.Source,
@@ -699,6 +857,7 @@ func buildStatus(eng *engine.Engine, tree *watcher.Tree, cfg config.Config, ph *
 			Peak:       st.Peak,
 			Open:       st.Open,
 			CloseWrite: s.CloseWrite,
+			FullResync: frText,
 		})
 	}
 	return doc

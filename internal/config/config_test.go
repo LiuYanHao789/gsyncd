@@ -477,3 +477,126 @@ func TestCloseWriteRejectsDisabledMaxHold(t *testing.T) {
 		t.Fatalf("close_write with the default max_hold must be accepted: %v", err)
 	}
 }
+
+// The fidelity and scheduling keys added for the lsyncd compatibility work
+// must round-trip, including the underscore spelling.
+func TestFidelityKeysParse(t *testing.T) {
+	const doc = `
+[[sync]]
+source = "/a"
+target = "/b"
+delay_mode = "deadline"
+preserve_mode = "basic"
+preserve_owner = "false"
+symlink_mode = "all"
+preserve_xattrs = true
+preserve_hardlinks = true
+sparse = true
+copy_special = true
+bandwidth_limit = "2m"
+full_resync = "6h"
+rsync_binary = "/opt/rsync"
+rsync_bwlimit = "50m"
+rsync_compress = true
+rsync_xattrs = true
+rsync_acls = true
+rsync_hard_links = true
+rsync_chown = "root:root"
+rsync_chmod = "D755,F644"
+rsync_password_file = "/etc/rsync.pass"
+rsync_path = "/usr/bin/rsync"
+rsync_delete_excluded = true
+`
+	cfg, err := Parse(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := cfg.Syncs[0]
+	if s.DelayMode != "deadline" || s.PreserveMode != "basic" || s.PreserveOwner != "false" || s.SymlinkMode != "all" {
+		t.Fatalf("modes: %+v", s)
+	}
+	if !s.PreserveXattrs || !s.PreserveHardlinks || !s.Sparse || !s.CopySpecial {
+		t.Fatalf("advanced fidelity: %+v", s)
+	}
+	if s.BandwidthLimit != 2<<20 || s.FullResync != 6*time.Hour {
+		t.Fatalf("sizes: bw=%d full=%v", s.BandwidthLimit, s.FullResync)
+	}
+	if s.RSyncBinary != "/opt/rsync" || s.RSyncBWLimit != 50<<20 || !s.RSyncCompress ||
+		!s.RSyncXattrs || !s.RSyncACLs || !s.RSyncHardLinks || !s.RSyncDeleteExcluded {
+		t.Fatalf("rsync options: %+v", s)
+	}
+	if s.RSyncChown != "root:root" || s.RSyncChmod != "D755,F644" ||
+		s.RSyncPasswordFile != "/etc/rsync.pass" || s.RSyncPath != "/usr/bin/rsync" {
+		t.Fatalf("rsync strings: %+v", s)
+	}
+}
+
+// exclude_from is read relative to the configuration file and its patterns
+// are prepended to the inline list.
+func TestExcludeFromFile(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "excludes.txt"), []byte("# comment\n*.tmp\n/cache/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(root, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := Sync{
+		Name: "x", Mode: ModeDirect, Source: src, Target: filepath.Join(root, "dst"),
+		Excludes: []string{"!keep.tmp"}, ExcludeFrom: []string{"excludes.txt"},
+	}
+	if err := s.Validate(root); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"*.tmp", "/cache/", "!keep.tmp"}
+	if len(s.Excludes) != len(want) {
+		t.Fatalf("excludes: %+v", s.Excludes)
+	}
+	for i := range want {
+		if s.Excludes[i] != want[i] {
+			t.Fatalf("excludes: %+v", s.Excludes)
+		}
+	}
+}
+
+// rsync's own rule: a colon before the first path separator means a host;
+// a colon after it is part of a local path. Getting this wrong skips path
+// resolution and the target guard for an ordinary directory.
+func TestIsRemoteTargetRules(t *testing.T) {
+	cases := map[string]bool{
+		"host:/path":       true,
+		"host::module":     true,
+		"rsync://h/module": true,
+		"backup@host:/srv": true,
+		"/mnt/data:snap":   false,
+		"./host:path":      false,
+		"/srv/data":        false,
+		`C:\dir`:           false,
+	}
+	for target, want := range cases {
+		if got := IsRemoteTarget(target); got != want {
+			t.Errorf("IsRemoteTarget(%q) = %v, want %v", target, got, want)
+		}
+	}
+}
+
+// A remote rsync target must stay opaque: joining it to the configuration
+// directory turns it into a local path named after the host.
+func TestRemoteRsyncTargetIsNotResolved(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := Sync{Name: "x", Mode: ModeRsync, Source: src, Target: "backup@host:/srv/data"}
+	if err := s.Validate(root); err != nil {
+		t.Fatal(err)
+	}
+	if s.Target != "backup@host:/srv/data" {
+		t.Fatalf("remote target was rewritten to %q", s.Target)
+	}
+	if !s.Remote {
+		t.Fatal("remote target was not inferred as Remote")
+	}
+}

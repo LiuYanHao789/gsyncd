@@ -43,20 +43,43 @@ func (h *Hasher) Name(name string) {
 	}
 }
 
-// Dir folds a subdirectory entry. Only its name counts: its own mtime changes
-// on every write below it, and including it would invalidate this directory's
-// record for the whole subtree's activity. The child's own record covers it.
-func (h *Hasher) Dir() { h.b('d') }
+// meta folds the permission word and owner. The checkpoint has to notice a
+// chmod or chown made while the daemon was stopped: those do not change the
+// directory mtime, and without this a held directory would be skipped and its
+// target would keep the old metadata forever.
+func (h *Hasher) meta(mode uint32, uid, gid int) {
+	h.u(uint64(mode))
+	h.u(uint64(int64(uid)))
+	h.u(uint64(int64(gid)))
+}
 
-// File folds a regular file entry, size and mtime included.
+// Dir folds a subdirectory entry. Its name and its own metadata count; its
+// own mtime does not, because it changes on every write below it and would
+// invalidate this directory's record for the whole subtree's activity. The
+// child's own record covers its content.
+func (h *Hasher) Dir(mode uint32, uid, gid int) {
+	h.b('d')
+	h.meta(mode, uid, gid)
+}
+
+// File folds a regular file entry, size, mtime and metadata included.
 //
 // The mtime is what catches a file rewritten in place: that does not bump the
 // parent directory's mtime, so the directory's own timestamp alone would let a
-// changed file look unchanged.
-func (h *Hasher) File(size, mtime int64) {
+// changed file look unchanged. Mode and owner catch a chmod/chown that leaves
+// the mtime alone.
+func (h *Hasher) File(size, mtime int64, mode uint32, uid, gid int) {
 	h.b('f')
 	h.u(uint64(size))
 	h.u(uint64(mtime))
+	h.meta(mode, uid, gid)
+}
+
+// Other folds a symlink or special entry by its metadata. The link target is
+// not available from FileInfo; replacing a link changes the parent mtime.
+func (h *Hasher) Other(mode uint32, uid, gid int) {
+	h.b('o')
+	h.meta(mode, uid, gid)
 }
 
 // Sum returns the digest.

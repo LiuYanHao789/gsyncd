@@ -185,6 +185,21 @@ func (l *Logger) ResetThrottle(key string) {
 	l.mu.Unlock()
 }
 
+// Flush pushes buffered log lines to the file without closing it.
+//
+// It is what a reload needs before syscall.Exec: the image is about to be
+// replaced, but other goroutines may still log until the very end, and
+// closing first would make those writes race a nil buffer. Exec keeps the
+// file descriptor, so flushing is enough.
+func (l *Logger) Flush() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if f, ok := l.out.(interface{ Flush() error }); ok {
+		return f.Flush()
+	}
+	return nil
+}
+
 // Close flushes and closes the underlying writer.
 func (l *Logger) Close() error {
 	l.mu.Lock()
@@ -262,6 +277,11 @@ func (r *rotator) open() error {
 func (r *rotator) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.bw == nil {
+		// Closed. A logger that is still referenced by a draining goroutine
+		// must drop the line, not dereference a nil buffer and panic.
+		return len(p), nil
+	}
 	// Buffered bytes are not in the file yet, so they have to be counted too:
 	// otherwise a burst of lines smaller than the buffer never rotates.
 	if r.maxBytes > 0 && r.size+int64(len(p)) > r.maxBytes {
@@ -305,6 +325,16 @@ func (r *rotator) rotate() error {
 	}
 	r.size = 0
 	return r.open()
+}
+
+// Flush pushes buffered bytes without closing the file.
+func (r *rotator) Flush() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.bw != nil {
+		return r.bw.Flush()
+	}
+	return nil
 }
 
 func (r *rotator) Close() error {

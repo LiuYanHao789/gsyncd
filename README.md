@@ -4,14 +4,17 @@
 
 ```
 $ gsyncd -version
-gsyncd 0.2.0 (1.23.9)
+gsyncd 0.4.0 (1.23.9)
 ```
 
 ## 特性
 
 - 递归 inotify 监视（Linux）；其它平台使用快照轮询
-- 事件聚合、`delay` 静默窗口、`max_hold` 强制刷新、可选 `close_write`
+- 事件聚合、`delay` 静默窗口（可选 lsyncd 风格的 `deadline`）、`max_hold` 强制刷新、可选 `close_write`
+- direct 元数据保真：完整 mode、owner（root）、文件/目录 mtime、符号链接策略；可选 xattr/ACL、硬链接、稀疏、特殊文件
 - 启动全量同步；`checkpoint` 断点续扫，重启不重扫目标端
+- SIGHUP 优雅重载：排空在途批次后以同一 pid 重新执行，配置变更无需重启
+- `rsyncssh` 的 move/delete 在远端本地执行（ssh），目录 rename 不重传
 - 原子替换：临时文件 → fsync（大文件）→ rename
 - 删除、重命名、排除规则；目录删除/重建和 rename 语义已加固
 - 传输时 SHA-256 内容校验（默认开启）；`-verify-tree` / `-verify-content` 离线校验
@@ -106,11 +109,27 @@ gsyncd -status /var/lib/gsyncd/status.json
 | `target_dir` | 源目录绝对路径 | 仅 `rsyncssh`：远端目标目录 |
 | `mode` | `direct` | `direct` \| `rsync` \| `rsyncssh` |
 | `delay` | `15s` | 事件静默多久后传输 |
-| `max_hold` | `1h` | 持续写入时最多等多久强制刷新；负值关闭 |
+| `delay_mode` | `"quiet"` | `"quiet"` 整树静默后刷；`"deadline"` 最早事件满 delay 即刷（lsyncd 语义） |
+| `max_hold` | `15m` | 持续写入时最多等多久强制刷新；负值关闭 |
 | `close_write` | `false` | 等待 writer 关闭后再同步 |
 | `delete` | `true` | `true`/`false`/`"startup"`/`"running"` |
 | `excludes` | `[]` | rsync 风格排除模式 |
+| `exclude_from` | `[]` | 排除规则文件（相对配置文件目录），文件规则在前、内联规则在后 |
+| `preserve_mode` | `"full"` | `"full"` 保留 setuid/setgid/sticky；`"basic"` 仅 0777 |
+| `preserve_owner` | `"auto"` | `"auto"` 仅 root 时 chown；`true`/`false` |
+| `symlink_mode` | `"safe"` | `"safe"` 仅根内链接；`"all"` 原样复制；`"skip"` |
+| `preserve_xattrs` | `false` | Linux xattr（含 POSIX ACL），尽力而为 |
+| `preserve_hardlinks` | `false` | 单次初始扫描内重建硬链接 |
+| `sparse` | `false` | Linux 稀疏文件 |
+| `copy_special` | `false` | Linux FIFO/设备节点（设备节点需要 root） |
+| `bandwidth_limit` | `0` | direct 复制限速（字节/秒）；`rsync_*` 用 `rsync_bwlimit` |
+| `full_resync` | `0` | 本 sync 的周期全量；0 继承全局 |
+| `remote` | 自动推断 | 强制把含冒号的目标按 rsync 远端处理（覆盖自动推断） |
 | `rsync_extra` | `[]` | 追加给 rsync 的参数（`rsyncopts` 是兼容别名） |
+| `rsync_binary` / `rsync_bwlimit` / `rsync_compress` | — | 结构化 rsync 选项；见示例配置 |
+| `rsync_xattrs` / `rsync_acls` / `rsync_hard_links` | `false` | rsync 元数据保真 |
+| `rsync_chown` / `rsync_chmod` / `rsync_password_file` / `rsync_path` | — | rsync 透传选项 |
+| `rsync_delete_excluded` | `false` | 全量传输时同时删除被排除的目标项 |
 | `max_processes` | 0（用全局） | 该 sync 的并发上限 |
 | `workers` | `min(CPU,16)` | direct 并行拷贝 goroutine 数 |
 | `prefetch` | `min(CPU,16)` | direct 初始遍历预读目录的 goroutine 数 |
@@ -139,6 +158,19 @@ gsyncd -config /etc/gsyncd/gsyncd.toml -init-target
 ```
 
 运行中目标被移走/替换时，批次会拒绝写入并退避重试；目标恢复后自动收敛。目标若被重新挂载为新 inode，需要重启 gsyncd。
+
+## 与上游 lsyncd 的语义差异
+
+迁移前请确认以下差异，它们都是有意设计，不是缺陷：
+
+- **配置**：TOML 静态配置，不支持 Lua、Layer1~4、`onCreate/onStartup` 等任意 hook，也不支持 tunnel / crontab。需要外部编排时，请轮询 JSON 状态文件或由外部脚本触发。
+- **`delay`**：默认是“整棵树静默 delay 后刷”，不是 lsyncd 的“每条事件到期即刷”。持续写入的树请设 `delay_mode = "deadline"`；`max_hold`（默认 15m）是永不静默时的兜底。
+- **元数据**：direct 默认保留完整 mode、owner（仅 root）、文件/目录 mtime、符号链接；xattr/ACL、硬链接、稀疏文件、设备节点需要显式打开。目标根目录本身不 chown/chmod。`preserve_xattrs` 会禁用 checkpoint 的目录跳过：启动时逐文件核对属性（只写差异），大树上会增加一次元数据遍历。
+- **符号链接**：默认 `safe`，指向同步根外部的链接不会被镜像；`all` 才是 lsyncd `-l` 的原样行为。
+- **删除**：运行期删除由事件驱动，不主动扫描目标端多余项；目标端漂移由 Startup 或 `full_resync` 收敛。`delete = "running"` / `"startup"` 与 lsyncd 一致。重命名（`mv a b`）的旧名 `a` 总会从目标端移除，即使 `delete = false`/`"startup"`；这是 rename 语义，不是删除策略。
+- **rsync / rsyncssh**：增量传输用 `--files-from` + 显式删除，不在增量批次上使用 `--delete`；`rsyncssh` 的 move/delete 通过 ssh 在远端本地执行，ssh 不可用时回退 rsync。`mode = "rsync"` 的远端目标删除走 `--delete-missing-args`。
+- **重载**：SIGHUP 会先排空在途批次、刷新窗口，再以同一 pid 重新执行自身；配置变更不需要手动重启。TERM/INT 正常退出。
+- **平台**：macOS/Windows 使用轮询兜底，没有 fsevents；大目录树请以 Linux 为主。
 
 ## 构建
 

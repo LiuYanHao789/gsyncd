@@ -136,7 +136,7 @@ func TestRemoteDeleteForcesNonEmptyDirectories(t *testing.T) {
 // target forever.
 func TestRenameSchedulesOldNameForDeletion(t *testing.T) {
 	r := NewRSync("/src", "/dst", true, nil, nil)
-	uploads, deletes := r.plan([]aggregate.Change{
+	uploads, deletes, moveDeletes := r.plan([]aggregate.Change{
 		{Path: "/src/new.txt", From: "/src/old.txt", Op: event.Move, Kind: aggregate.KindFile},
 		{Path: "/src/gone.txt", Op: event.Delete, Kind: aggregate.KindFile},
 		{Path: "/src/fresh.txt", Op: event.Create | event.Write, Kind: aggregate.KindFile},
@@ -144,8 +144,12 @@ func TestRenameSchedulesOldNameForDeletion(t *testing.T) {
 	if len(uploads) != 2 || uploads[0] != "new.txt" || uploads[1] != "fresh.txt" {
 		t.Fatalf("uploads = %v, want [new.txt fresh.txt]", uploads)
 	}
-	// Order follows the change list: the rename came first, then the deletion.
-	if len(deletes) != 2 || deletes[0] != "/src/old.txt" || deletes[1] != "/src/gone.txt" {
-		t.Fatalf("deletes = %v, want the deletion plus the old name of the rename", deletes)
+	// A rename's old name is separate: it is removed even when runtime
+	// deletions are disabled.
+	if len(moveDeletes) != 1 || moveDeletes[0] != "/src/old.txt" {
+		t.Fatalf("moveDeletes = %v, want [/src/old.txt]", moveDeletes)
+	}
+	if len(deletes) != 1 || deletes[0] != "/src/gone.txt" {
+		t.Fatalf("deletes = %v, want [/src/gone.txt]", deletes)
 	}
 }

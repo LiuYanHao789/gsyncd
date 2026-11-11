@@ -64,6 +64,42 @@ type Direct struct {
 	Verify bool
 	// VerifyRetries is how many extra copy attempts a mismatch gets.
 	VerifyRetries int
+	// PreserveOwner is "auto", "true" or "false". Auto copies uid/gid only
+	// when the process is root; a failure is logged once and never fails the
+	// copy, because a non-root run or a root-squashed NFS target is a normal
+	// deployment.
+	PreserveOwner string
+	// FullMode restores setuid/setgid/sticky in addition to the low nine
+	// permission bits.
+	FullMode bool
+	// SymlinkMode is "safe", "all" or "skip".
+	SymlinkMode string
+	// PreserveXattrs copies extended attributes (including POSIX ACLs on
+	// Linux) for regular files and directories.
+	PreserveXattrs bool
+	// PreserveHardlinks recreates hardlink groups inside one initial pass.
+	PreserveHardlinks bool
+	// Sparse preserves holes when copying regular files on platforms that
+	// support SEEK_DATA/SEEK_HOLE.
+	Sparse bool
+	// CopySpecial recreates FIFOs and device nodes instead of skipping them.
+	CopySpecial bool
+	// Bandwidth is the direct copy throughput cap in bytes per second. Zero
+	// means unlimited.
+	Bandwidth int64
+
+	// links maps a source hardlink group to the first target path that was
+	// written for it. It is rebuilt for every initial pass and guarded because
+	// copy workers run concurrently. A group whose members are processed
+	// simultaneously may be recorded twice; that only costs an extra copy,
+	// never a wrong link. Runtime batches copy independently.
+	linkMu    sync.Mutex
+	links     map[linkKey]string
+	linkLocks map[linkKey]*sync.Mutex
+
+	// limiter is rebuilt for every pass so the configured rate is shared by
+	// all workers of that pass instead of being applied per file.
+	limiter *rateLimiter
 	// targetInfo is the identity of the target directory captured by Startup.
 	// Before every batch it is compared with the current path: a target that
 	// was moved, unmounted or replaced while the daemon ran must not silently
@@ -130,6 +166,151 @@ func NewDirect(source, target string, del bool, workers int, logf func(string, s
 	}
 }
 
+// copyOptions is the per-file policy for copyFile and copyTree. It is a struct
+// rather than a parameter list because the initial walk, the runtime workers
+// and the rename fallbacks all share it, and each new fidelity option would
+// otherwise add another positional argument to every one of them.
+type copyOptions struct {
+	Fsync      bool
+	Verify     bool
+	Retries    int
+	FullMode   bool
+	Chown      bool
+	Xattrs     bool
+	Sparse      bool
+	CopySpecial bool
+	Limiter     *rateLimiter
+	SymlinkMode string
+	Logf        func(string, string, ...any)
+}
+
+// linkKey identifies a hardlink group by device and inode.
+type linkKey struct {
+	dev uint64
+	ino uint64
+}
+
+// beginLinkPass starts a fresh hardlink table for one initial copy.
+func (d *Direct) beginLinkPass() {
+	d.linkMu.Lock()
+	if d.PreserveHardlinks {
+		d.links = make(map[linkKey]string)
+		d.linkLocks = make(map[linkKey]*sync.Mutex)
+	} else {
+		d.links = nil
+		d.linkLocks = nil
+	}
+	d.linkMu.Unlock()
+}
+
+// endLinkPass releases the table.
+func (d *Direct) endLinkPass() {
+	d.linkMu.Lock()
+	d.links = nil
+	d.linkLocks = nil
+	d.linkMu.Unlock()
+}
+
+// lockLink serialises the check/copy/record sequence for one hardlink group.
+//
+// Two workers handling two names of the same inode would otherwise both miss
+// the table, copy the file twice, and never create a link. The lock is per
+// group, so unrelated files still copy in parallel.
+func (d *Direct) lockLink(k linkKey) func() {
+	d.linkMu.Lock()
+	if d.linkLocks == nil {
+		d.linkLocks = make(map[linkKey]*sync.Mutex)
+	}
+	m := d.linkLocks[k]
+	if m == nil {
+		m = &sync.Mutex{}
+		d.linkLocks[k] = m
+	}
+	d.linkMu.Unlock()
+	m.Lock()
+	return m.Unlock
+}
+
+func (d *Direct) lookupLink(k linkKey) (string, bool) {
+	d.linkMu.Lock()
+	defer d.linkMu.Unlock()
+	p, ok := d.links[k]
+	return p, ok
+}
+
+func (d *Direct) recordLink(k linkKey, path string) {
+	d.linkMu.Lock()
+	if d.links == nil {
+		d.links = make(map[linkKey]string)
+	}
+	if _, ok := d.links[k]; !ok {
+		d.links[k] = path
+	}
+	d.linkMu.Unlock()
+}
+
+// beginBandwidth creates the limiter shared by every worker of one pass.
+func (d *Direct) beginBandwidth() { d.limiter = newRateLimiter(d.Bandwidth) }
+
+// copyOptions snapshots the backend's current policy.
+func (d *Direct) copyOptions() copyOptions {
+	return copyOptions{
+		Fsync:       d.Fsync,
+		Verify:      d.Verify,
+		Retries:     d.VerifyRetries,
+		FullMode:    d.FullMode,
+		Chown:       d.wantOwner(),
+		Xattrs:      d.PreserveXattrs,
+		Sparse:      d.Sparse,
+		CopySpecial: d.CopySpecial,
+		Limiter:     d.limiter,
+		SymlinkMode: d.SymlinkMode,
+		Logf:        d.Logf,
+	}
+}
+
+// wantOwner reports whether uid/gid should be copied. "auto" means "only when
+// root": a non-root process cannot chown, and trying per file would turn every
+// copy into a logged failure.
+func (d *Direct) wantOwner() bool {
+	switch d.PreserveOwner {
+	case "true":
+		return true
+	case "false":
+		return false
+	default:
+		return canChown()
+	}
+}
+
+// dirMetaMatches reports whether the target directory already carries the
+// mode and owner the source has. The checkpoint's mtime and content digest
+// cannot see a chmod/chown made while the daemon was stopped, so a held
+// directory is only safe when this also matches.
+func (d *Direct) dirMetaMatches(target, src os.FileInfo) bool {
+	modeMask := os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+	if target.Mode()&modeMask != fullModeOf(src.Mode(), d.FullMode) {
+		return false
+	}
+	if d.wantOwner() {
+		su, sg, ok1 := ownerOf(src)
+		tu, tg, ok2 := ownerOf(target)
+		if ok1 && ok2 && (su != tu || sg != tg) {
+			return false
+		}
+	}
+	return true
+}
+
+// fullModeOf returns the permission word to restore. Basic keeps the low nine
+// bits, which is what the backend did before owner and setuid support existed.
+func fullModeOf(m os.FileMode, full bool) os.FileMode {
+	if full {
+		return m & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
+	}
+	return m.Perm()
+}
+
 // Name implements Backend.
 func (d *Direct) Name() string { return "direct" }
 
@@ -163,6 +344,9 @@ func (d *Direct) UseCheckpoint(st *scanstate.Store) { d.scan = st }
 // The target prune is folded into the same walk that does the copying (see
 // walkCopy) instead of running as a separate whole-tree pass.
 func (d *Direct) Startup(ctx context.Context) error {
+	d.beginBandwidth()
+	d.beginLinkPass()
+	defer d.endLinkPass()
 	if d.TargetGuard {
 		// Never create the target: a missing path is exactly the signal that
 		// the backup filesystem is not mounted, and creating it here would
@@ -249,7 +433,8 @@ func (d *Direct) pruneDir(ctx context.Context, srcDir, dstDir string, dstEnts []
 		// FIFOs, sockets and device nodes are skipped (copying a FIFO would
 		// block forever), so an old regular file at such a name is stale and
 		// has to be pruned.
-		if e.IsDir() || e.Type().IsRegular() || e.Type()&os.ModeSymlink != 0 {
+		if e.IsDir() || e.Type().IsRegular() || e.Type()&os.ModeSymlink != 0 ||
+			(d.CopySpecial && e.Type()&(os.ModeNamedPipe|os.ModeDevice) != 0) {
 			keep[e.Name()] = struct{}{}
 		}
 	}
@@ -372,8 +557,12 @@ type walkItem struct {
 // Nothing ever waits on a pending, which is why the walk can run at full speed
 // even when a single directory holds one enormous file.
 type pending struct {
+	src    string
 	dst    string
 	mtime  time.Time
+	info   os.FileInfo
+	opts   copyOptions
+	noMeta bool
 	left   int32
 	sealed int32
 	failed int32
@@ -393,6 +582,24 @@ func (p *pending) finish() {
 			// An entry failed, so the directory does not hold what the record
 			// will claim. Leaving the timestamp alone makes it fail its check
 			// next time and get reconciled again, which is the safe direction.
+			// This has to be checked before the root's mtime stamp as well.
+			return
+		}
+		if p.noMeta {
+			// The sync root maps to the target root, which is routinely a
+			// mount point whose mode and owner belong to the operator. The
+			// mtime is different: the checkpoint's root record is compared
+			// against it, so it still has to be stamped.
+			if err := os.Chtimes(p.dst, p.mtime, p.mtime); err != nil && p.logf != nil {
+				p.logf("warn", "cannot set directory mtime on %s: %v", p.dst, err)
+			}
+			return
+		}
+		if p.info != nil {
+			// Owner, mode, xattrs and mtime are applied only now: copying a
+			// child updates the directory's mtime, so anything set earlier
+			// would be undone by the very files this wait is for.
+			applyMeta(p.src, p.dst, p.info, p.opts)
 			return
 		}
 		// A coarse, read-only or root-squashed target filesystem lands here.
@@ -470,11 +677,37 @@ func (d *Direct) noteSpecial(rel string, info os.FileInfo) {
 	}
 }
 
+// noteSpecialError reports a special file that could not be recreated.
+//
+// copy_special is best effort: a non-root run cannot mknod a device, and a
+// target filesystem may refuse FIFOs. Retrying the whole tree because of that
+// would turn one unprivileged node into an endless full rescan, so the failure
+// is sampled and the pass continues.
+func (d *Direct) noteSpecialError(rel string, err error) {
+	n := atomic.AddInt64(&d.special, 1)
+	if n <= 10 || n%10000 == 0 {
+		d.Logf("warn", "cannot recreate special file %s: %v (further failures suppressed)", rel, err)
+	}
+}
+
 // symlinkTargetFor returns the link text to use on the target. Links that
 // resolve inside the sync root are mirrored; absolute internal links are
 // rewritten to the mirror root so they resolve there. Links pointing outside
 // are not followed and not copied.
 func (d *Direct) symlinkTargetFor(srcPath, link string) (string, bool) {
+	switch d.SymlinkMode {
+	case "skip":
+		n := atomic.AddInt64(&d.linksSkipped, 1)
+		if n <= 10 || n%10000 == 0 {
+			d.Logf("info", "symlink %s not mirrored (symlink_mode=skip)", srcPath)
+		}
+		return "", false
+	case "all":
+		// Verbatim, including links that point outside the sync root. This is
+		// what cp -a and rsync's default -l do, and it is the faithful choice
+		// for a backup even though the target cannot necessarily resolve it.
+		return link, true
+	}
 	text, ok := symlinkText(d.Source, d.Target, srcPath, link)
 	if !ok {
 		n := atomic.AddInt64(&d.linksSkipped, 1)
@@ -696,8 +929,10 @@ func (d *Direct) walkCopy(ctx context.Context) error {
 
 	closeFrame := func(fr *walkFrame) error {
 		if !tracking {
-			// Frames exist for the walk's own bookkeeping only; without a
-			// checkpoint there is no digest to close and nothing to record.
+			// No digest to close, but the directory still has to be stamped
+			// after its last file lands. Sealing with no checkpoint simply
+			// waits for the copy workers and applies owner/mode/mtime.
+			fr.pd.seal()
 			return nil
 		}
 		fresh := scanstate.Record{
@@ -775,13 +1010,17 @@ func (d *Direct) walkCopy(ctx context.Context) error {
 		fr := frames[len(frames)-1]
 		fr.cnt++
 		fr.hash.Name(name)
+		mode := uint32(info.Mode() & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky))
+		uid, gid, _ := ownerOf(info)
 		if info.IsDir() {
-			fr.hash.Dir()
+			fr.hash.Dir(mode, uid, gid)
 			return
 		}
 		if info.Mode().IsRegular() {
-			fr.hash.File(info.Size(), info.ModTime().UnixNano())
+			fr.hash.File(info.Size(), info.ModTime().UnixNano(), mode, uid, gid)
+			return
 		}
+		fr.hash.Other(mode, uid, gid)
 	}
 
 	// The walk reads listings ahead of the visit, which on a cold cache is the
@@ -815,6 +1054,16 @@ func (d *Direct) walkCopy(ctx context.Context) error {
 				return cerr
 			}
 		}
+		// Exclusions are tested before any type-specific branch. Testing them
+		// after the symlink and special-file branches meant an excluded FIFO
+		// or symlink was still mirrored at startup while the watcher filtered
+		// it at runtime.
+		if rel != "." && d.Ignore != nil && d.Ignore(filepath.ToSlash(rel), info.IsDir()) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		if info.Mode()&os.ModeSymlink != 0 {
 			// Internal links are mirrored as links; links pointing outside the
 			// sync root are skipped (and logged) rather than followed: the
@@ -826,20 +1075,21 @@ func (d *Direct) walkCopy(ctx context.Context) error {
 			return nil
 		}
 		if !info.IsDir() && !info.Mode().IsRegular() {
-			// A FIFO/socket/device node cannot be copied: opening a FIFO
-			// blocks until a writer appears, which would wedge a copy worker
-			// (and the whole pass) forever. Skip it, and let pruneDir remove
-			// any stale regular file at the same name.
-			d.noteSpecial(rel, info)
-			fold(info.Name(), info)
-			return nil
-		}
-		if d.Ignore != nil && d.Ignore(filepath.ToSlash(rel), info.IsDir()) {
-			if info.IsDir() {
-				// SkipDir also stops the walk from descending, which is the
-				// point: an excluded directory is not scanned at all.
-				return filepath.SkipDir
+			// A FIFO/socket/device node cannot be read like a file: opening a
+			// FIFO blocks until a writer appears, which would wedge a copy
+			// worker (and the whole pass) forever. It can be recreated with
+			// mknod/mkfifo when copy_special is on; otherwise it is skipped
+			// and pruneDir removes any stale regular file at the same name.
+			if d.CopySpecial {
+				if err := makeSpecial(filepath.Join(d.Target, rel), info, d.copyOptions()); err != nil {
+					d.noteSpecialError(rel, err)
+				} else {
+					atomic.AddUint64(&d.st.Files, 1)
+				}
+			} else {
+				d.noteSpecial(rel, info)
 			}
+			fold(info.Name(), info)
 			return nil
 		}
 		fold(info.Name(), info)
@@ -849,20 +1099,42 @@ func (d *Direct) walkCopy(ctx context.Context) error {
 				rel:  rel,
 				src:  p,
 				dst:  dir,
-				perm: info.Mode().Perm(),
+				perm: fullModeOf(info.Mode(), d.FullMode),
 				mt:   info.ModTime().UnixNano(),
+			}
+			// The pending timestamp/meta work is not checkpoint specific:
+			// without it a startup pass would lose directory mtime and owner
+			// for every sync that does not configure a checkpoint.
+			fr.pd = &pending{
+				src: p, dst: dir, mtime: info.ModTime(), info: info,
+				opts: d.copyOptions(), logf: d.Logf,
+				// The sync root maps to the target root, which is usually a
+				// mount point; stamp its mtime for the checkpoint but leave
+				// mode/owner/xattrs to the operator.
+				noMeta: rel == ".",
 			}
 			if tracking {
 				fr.hash = scanstate.NewHasher()
-				fr.pd = &pending{dst: dir, mtime: info.ModTime(), logf: d.Logf}
 				// The record is only usable when the target directory still
 				// carries the timestamp the record expects: that is the only
 				// evidence available without reading the target, and any hand
 				// edit, stray write or restore changes it.
-				if base, ok := d.scan.Lookup(rel); ok {
+				base, ok := d.scan.Lookup(rel)
+				if ok {
 					checked++
+				}
+				// A directory can only be held when nothing about its target
+				// metadata is unverified. xattrs, hardlink identity and
+				// special-file contents are not in the digest, so those
+				// options simply disable the shortcut; the pass re-verifies
+				// instead of silently keeping stale metadata.
+				holdable := !d.PreserveXattrs && !d.PreserveHardlinks && !d.CopySpecial
+				if ok && holdable {
 					if st, serr := os.Stat(dir); serr == nil && st.IsDir() &&
-						st.ModTime().UnixNano() == truncateMtimeNanos(base.Mtime, d.mtimeGran) {
+						st.ModTime().UnixNano() == truncateMtimeNanos(base.Mtime, d.mtimeGran) &&
+						// The root's mode/owner are intentionally not mirrored,
+						// so they must not block its checkpoint record.
+						(rel == "." || d.dirMetaMatches(st, info)) {
 						fr.hold = true
 						fr.base = base
 					}
@@ -887,10 +1159,10 @@ func (d *Direct) walkCopy(ctx context.Context) error {
 			return nil
 		}
 		var pd *pending
-		if tracking && len(frames) > 0 {
+		if len(frames) > 0 {
 			parent := frames[len(frames)-1]
 			pd = parent.pd
-			if parent.hold && len(parent.todo) < maxHeldFiles {
+			if tracking && parent.hold && len(parent.todo) < maxHeldFiles {
 				// Held, not copied: if the digest below confirms the record,
 				// this file never has to be looked at again.
 				parent.todo = append(parent.todo, walkItem{rel: rel, info: info})
@@ -975,29 +1247,135 @@ func mkdirOnce(dir string, perm os.FileMode) error {
 	return err
 }
 
+// sameFile reports whether two paths name the same inode.
+func sameFile(a, b string) bool {
+	ai, err := os.Lstat(a)
+	if err != nil {
+		return false
+	}
+	bi, err := os.Lstat(b)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(ai, bi)
+}
+
+// linkInto makes dst a hardlink to src by linking to a temporary name and
+// renaming it into place, so a reader never sees a partially linked path.
+func linkInto(src, dst string) error {
+	dir := filepath.Dir(dst)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	f, err := createTemp(dir, tmpPrefix+"link-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	_ = f.Close()
+	_ = os.Remove(tmp)
+	if err := os.Link(src, tmp); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
 // copyFileAt copies one regular file whose parent directory the walk already
 // created.
 func (d *Direct) copyFileAt(ctx context.Context, rel string, info os.FileInfo) error {
 	dst := filepath.Join(d.Target, rel)
 	// Skip when the destination is already identical (size and mtime). On a
 	// fresh target nothing can match, so the stat is skipped entirely.
+	var key linkKey
+	hasKey := false
+	if d.PreserveHardlinks {
+		if dev, ino, ok := linkKeyOf(info); ok {
+			key, hasKey = linkKey{dev: dev, ino: ino}, true
+		}
+	}
+	if hasKey {
+		unlock := d.lockLink(key)
+		defer unlock()
+	}
 	if !d.freshTarget {
-		if st, err := os.Stat(dst); err == nil && st.Size() == info.Size() && st.ModTime().UnixNano() == truncateMtimeNanos(info.ModTime().UnixNano(), d.mtimeGran) {
+		modeMask := os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+		// Lstat, and regular only: a symlink at the target path must be
+		// replaced as a type change, never followed into an outside file.
+		if st, err := os.Lstat(dst); err == nil && st.Mode().IsRegular() &&
+			st.Size() == info.Size() && st.ModTime().UnixNano() == truncateMtimeNanos(info.ModTime().UnixNano(), d.mtimeGran) {
+			modeSame := st.Mode()&modeMask == fullModeOf(info.Mode(), d.FullMode)
+			ownerSame := true
+			if d.wantOwner() {
+				if u1, g1, ok1 := ownerOf(info); ok1 {
+					if u2, g2, ok2 := ownerOf(st); ok2 && (u1 != u2 || g1 != g2) {
+						ownerSame = false
+					}
+				}
+			}
+			if !modeSame || !ownerSame {
+				// Content is already right; only mode/owner differ. Fix them
+				// without reading and rewriting the file.
+				applyMeta(d.Source+string(filepath.Separator)+rel, dst, info, d.copyOptions())
+			} else if d.PreserveXattrs {
+				// Only xattrs remain to check. copyXattrs compares values and
+				// writes only differences, so an unchanged tree costs reads,
+				// not a full metadata rewrite.
+				if err := copyXattrs(d.Source+string(filepath.Separator)+rel, dst); err != nil {
+					xattrWarn.Do(func() {
+						warnf(d.Logf, "cannot copy extended attributes for %s (further failures suppressed): %v", dst, err)
+					})
+				}
+			}
+			if hasKey {
+				// An already-populated target may hold the group members as
+				// separate inodes. The fast path would otherwise just record
+				// one and never link the rest, so preserve_hardlinks would
+				// never converge on a restart. Replace a separate copy with a
+				// link to the first one when content already matches.
+				if first, ok := d.lookupLink(key); ok {
+					if !sameFile(first, dst) {
+						if err := linkInto(first, dst); err == nil {
+							atomic.AddUint64(&d.st.Files, 1)
+							return nil
+						}
+					}
+				} else {
+					d.recordLink(key, dst)
+				}
+			}
 			return nil
 		}
 	}
-	err := copyFile(d.Source+string(filepath.Separator)+rel, dst, info, d.Fsync, d.Verify, d.VerifyRetries, d.Logf)
+	if hasKey {
+		if first, ok := d.lookupLink(key); ok {
+			if err := linkInto(first, dst); err == nil {
+				atomic.AddUint64(&d.st.Files, 1)
+				return nil
+			}
+			// Cross-device or a target that refuses links: fall back to a
+			// normal copy rather than failing the file.
+		}
+	}
+	opts := d.copyOptions()
+	err := copyFile(d.Source+string(filepath.Separator)+rel, dst, info, opts)
 	if errors.Is(err, os.ErrNotExist) {
 		// The directory is missing despite the walk order: another sync
 		// sharing this target removed it, or the walk skipped it because
 		// it was unreadable. Recreate and retry once.
 		if mkErr := os.MkdirAll(filepath.Dir(dst), 0o755); mkErr == nil {
-			err = copyFile(d.Source+string(filepath.Separator)+rel, dst, info, d.Fsync, d.Verify, d.VerifyRetries, d.Logf)
+			err = copyFile(d.Source+string(filepath.Separator)+rel, dst, info, opts)
 		}
 	}
 	if err != nil {
 		atomic.AddUint64(&d.st.Errors, 1)
 		return err
+	}
+	if hasKey {
+		d.recordLink(key, dst)
 	}
 	atomic.AddUint64(&d.st.Files, 1)
 	return nil
@@ -1096,7 +1474,7 @@ func copyBounded(dst io.Writer, src io.Reader, n int64, h hash.Hash) (int64, err
 // a target filesystem that refuses the operation for every file. The first
 // occurrence carries a path and the error; the rest are counted by the copy
 // error path if they matter.
-var chmodWarn, chtimesWarn sync.Once
+var chmodWarn, chtimesWarn, chownWarn, xattrWarn sync.Once
 
 func warnf(logf func(string, string, ...any), format string, args ...any) {
 	if logf != nil {
@@ -1115,27 +1493,27 @@ var ErrVerifyMismatch = errors.New("content verification mismatch")
 // is read back and hashed before the rename. A mismatch retries from scratch;
 // the previously correct target is untouched until the rename, so a failed
 // verification never destroys good data.
-func copyFile(src, dst string, info os.FileInfo, fsyncAll, verify bool, retries int, logf func(string, string, ...any)) error {
-	if retries < 0 {
-		retries = 0
+func copyFile(src, dst string, info os.FileInfo, opts copyOptions) error {
+	if opts.Retries < 0 {
+		opts.Retries = 0
 	}
 	var last error
-	for attempt := 0; attempt <= retries; attempt++ {
-		err := copyFileOnce(src, dst, info, fsyncAll, verify, logf)
+	for attempt := 0; attempt <= opts.Retries; attempt++ {
+		err := copyFileOnce(src, dst, info, opts)
 		if err == nil {
 			return nil
 		}
 		last = err
-		if !verify || !errors.Is(err, ErrVerifyMismatch) {
+		if !opts.Verify || !errors.Is(err, ErrVerifyMismatch) {
 			return err
 		}
-		warnf(logf, "content verification failed for %s (attempt %d/%d): %v", dst, attempt+1, retries+1, err)
+		warnf(opts.Logf, "content verification failed for %s (attempt %d/%d): %v", dst, attempt+1, opts.Retries+1, err)
 		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
 	}
 	return last
 }
 
-func copyFileOnce(src, dst string, info os.FileInfo, fsyncAll, verify bool, logf func(string, string, ...any)) error {
+func copyFileOnce(src, dst string, info os.FileInfo, opts copyOptions) error {
 	in, err := openRead(src)
 	if err != nil {
 		return err
@@ -1143,7 +1521,7 @@ func copyFileOnce(src, dst string, info os.FileInfo, fsyncAll, verify bool, logf
 	defer in.Close()
 
 	var srcHash hash.Hash
-	if verify {
+	if opts.Verify {
 		srcHash = sha256.New()
 	}
 
@@ -1166,11 +1544,48 @@ func copyFileOnce(src, dst string, info os.FileInfo, fsyncAll, verify bool, logf
 	// and the next pass could conclude the file is already up to date. A short
 	// read only happens if the file shrank, which is harmless: the next event
 	// brings it back.
-	if _, err := copyBounded(tmp, in, info.Size(), srcHash); err != nil {
-		tmp.Close()
+	copyNormal := func() error {
+		var r io.Reader = in
+		if opts.Limiter != nil {
+			r = newThrottledReader(r, opts.Limiter)
+		}
+		_, err := copyBounded(tmp, r, info.Size(), srcHash)
 		return err
 	}
-	if fsyncAll || info.Size() >= fsyncThreshold {
+	var copyErr error
+	if opts.Sparse && sparseSupported() && sparseSupportedOn(in) {
+		// The sparse copier hashes the full logical content, including holes,
+		// so verification still compares what a reader would see.
+		_, copyErr = copySparse(tmp, in, info.Size(), srcHash, opts.Limiter)
+		if errors.Is(copyErr, errSparseUnsupported) {
+			// A filesystem can accept SEEK_DATA and still reject SEEK_HOLE, or
+			// change its answer mid-file. Restart as a plain copy with a clean
+			// hash and an empty staging file instead of failing the transfer.
+			if opts.Verify {
+				srcHash = sha256.New()
+			}
+			if _, err := in.Seek(0, io.SeekStart); err != nil {
+				tmp.Close()
+				return err
+			}
+			if err := tmp.Truncate(0); err != nil {
+				tmp.Close()
+				return err
+			}
+			if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+				tmp.Close()
+				return err
+			}
+			copyErr = copyNormal()
+		}
+	} else {
+		copyErr = copyNormal()
+	}
+	if copyErr != nil {
+		tmp.Close()
+		return copyErr
+	}
+	if opts.Fsync || info.Size() >= fsyncThreshold {
 		if err := tmp.Sync(); err != nil {
 			tmp.Close()
 			return err
@@ -1179,19 +1594,41 @@ func copyFileOnce(src, dst string, info os.FileInfo, fsyncAll, verify bool, logf
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if verify {
+	if opts.Verify {
 		if err := verifyStaged(tmpName, info.Size(), srcHash); err != nil {
 			return err
 		}
 	}
-	if err := os.Chmod(tmpName, info.Mode().Perm()); err != nil {
-		chmodWarn.Do(func() { warnf(logf, "cannot set permissions on %s: %v", tmpName, err) })
+	// chown before chmod: on many systems chown clears setuid/setgid, so
+	// setting the mode first would silently drop the bits the operator asked
+	// to preserve.
+	if opts.Chown {
+		if uid, gid, ok := ownerOf(info); ok {
+			if err := chownPath(tmpName, uid, gid); err != nil {
+				chownWarn.Do(func() {
+					warnf(opts.Logf, "cannot set owner on %s (further failures suppressed): %v", tmpName, err)
+				})
+			}
+		}
+	}
+	// Xattrs before the final chmod: setting user.* on a read-only inode
+	// fails with EACCES, while the staging file is still 0600 here. The
+	// final chmod also settles the POSIX ACL mask at the source mode.
+	if opts.Xattrs {
+		if err := copyXattrs(src, tmpName); err != nil {
+			xattrWarn.Do(func() {
+				warnf(opts.Logf, "cannot copy extended attributes for %s (further failures suppressed): %v", src, err)
+			})
+		}
+	}
+	if err := os.Chmod(tmpName, fullModeOf(info.Mode(), opts.FullMode)); err != nil {
+		chmodWarn.Do(func() { warnf(opts.Logf, "cannot set permissions on %s: %v", tmpName, err) })
 	}
 	if err := os.Chtimes(tmpName, info.ModTime(), info.ModTime()); err != nil {
 		// mtime is part of the consistency contract, so a filesystem that
 		// refuses it (root-squashed NFS, some FUSE targets) must be visible.
 		// The copy itself is still correct; verification reports the mismatch.
-		chtimesWarn.Do(func() { warnf(logf, "cannot set mtime on %s: %v", tmpName, err) })
+		chtimesWarn.Do(func() { warnf(opts.Logf, "cannot set mtime on %s: %v", tmpName, err) })
 	}
 	// A directory where a file belongs is a type change; rename(2) cannot
 	// replace it, and leaving it would make every later copy of this path
@@ -1247,6 +1684,10 @@ func (d *Direct) Apply(ctx context.Context, b Batch) error {
 	if len(b.Changes) == 0 {
 		return nil
 	}
+	// Runtime batches do not preserve hardlinks; clear any table left by an
+	// interrupted initial pass so stale inode keys can never be consulted.
+	d.endLinkPass()
+	d.beginBandwidth()
 	// The target was verified by Startup. Re-check its identity before a
 	// batch: if the path disappeared (a moved mount, an unmounted disk whose
 	// mount point is now an ordinary directory) writing would recreate it and
@@ -1288,6 +1729,34 @@ func (d *Direct) Apply(ctx context.Context, b Batch) error {
 		}
 		return renames[i].From < renames[j].From
 	})
+
+	// Directories whose metadata has to be restored after the batch. Copying
+	// a file changes its parent's mtime, so the parent can only be stamped
+	// once every worker is done. These are source paths (c.Path/c.From), and
+	// the source filesystem has already applied the rename even though the
+	// target has not, so the captured FileInfo describes the moved tree, not
+	// the old target copy.
+	dirMeta := make(map[string]os.FileInfo)
+	noteDir := func(p string) {
+		if _, ok := dirMeta[p]; ok {
+			return
+		}
+		if info, err := os.Lstat(p); err == nil && info.IsDir() {
+			dirMeta[p] = info
+		}
+	}
+	for _, c := range renames {
+		noteDir(c.Path)
+		noteDir(filepath.Dir(c.Path))
+		noteDir(filepath.Dir(c.From))
+	}
+	for _, c := range dirs {
+		noteDir(c.Path)
+		noteDir(filepath.Dir(c.Path))
+	}
+	for _, c := range rest {
+		noteDir(filepath.Dir(c.Path))
+	}
 	// A full target stops the batch after a few failures instead of trying
 	// every remaining change.
 	ctx, cancel := context.WithCancel(ctx)
@@ -1391,6 +1860,42 @@ func (d *Direct) Apply(ctx context.Context, b Batch) error {
 	}
 	close(work)
 	wg.Wait()
+
+	// Restore directory metadata last, after every file is in place. This is
+	// what makes a runtime file change stop leaving the parent directory with
+	// a fresh mtime (and therefore a checkpoint miss on the next start).
+	// Only stamp directories when the whole batch succeeded. A partially
+	// failed batch is re-added and retried; stamping a directory whose file is
+	// missing would make it look more complete than it is.
+	if firstErr == nil {
+		opts := d.copyOptions()
+		// Deepest first: a directory whose final mode removes execute or
+		// write access must be stamped after everything below it has been.
+		type dirWork struct {
+			src   string
+			info  os.FileInfo
+			depth int
+		}
+		list := make([]dirWork, 0, len(dirMeta))
+		for src, info := range dirMeta {
+			list = append(list, dirWork{src: src, info: info, depth: strings.Count(filepath.ToSlash(src), "/")})
+		}
+		sort.SliceStable(list, func(i, j int) bool { return list[i].depth > list[j].depth })
+		for _, w := range list {
+			if filepath.Clean(w.src) == filepath.Clean(d.Source) {
+				// Never chmod or chown the target root itself. It is routinely
+				// a mount point owned by the operator, and changing its mode
+				// can make the mount unusable for everyone else.
+				continue
+			}
+			rel, ok := relInSource(d.Source, w.src)
+			if !ok {
+				continue
+			}
+			applyMeta(w.src, filepath.Join(d.Target, rel), w.info, opts)
+		}
+	}
+
 	if skipped > 0 {
 		d.Logf("warn", "%d changes not applied: %v", skipped, ctx.Err())
 	}
@@ -1437,6 +1942,7 @@ func skipOutside(logf func(string, string, ...any), err error) error {
 }
 
 func (d *Direct) applyRename(ctx context.Context, c aggregate.Change) error {
+	d.Logf("debug", "rename %s -> %s prev=%v op=%s", c.From, c.Path, c.PrevFrom, c.Op)
 	relFrom, err := d.relInside(c.From)
 	if err != nil {
 		return skipOutside(d.Logf, err)
@@ -1454,9 +1960,14 @@ func (d *Direct) applyRename(ctx context.Context, c aggregate.Change) error {
 	// A pending write was folded into this move (aggregate.applyMove carries
 	// Write/Create through a rename). Renaming the old target file would move
 	// the stale copy to the new name, so the content has to be copied.
-	dirty := c.Op&(event.Create|event.Write) != 0
+	// A rename that also carries a content or metadata change cannot be
+	// served by renaming the old target copy: that would move the stale file
+	// (or its stale mode/owner) to the new name. Attrib counts because mode
+	// and mtime may have changed without a Write.
+	dirty := c.Op&(event.Create|event.Write|event.Attrib) != 0
 	if !dirty {
 		if err := os.Rename(srcDst, dstDst); err == nil {
+			d.removePrevFrom(c)
 			atomic.AddUint64(&d.st.Files, 1)
 			return nil
 		}
@@ -1474,7 +1985,13 @@ func (d *Direct) applyRename(ctx context.Context, c aggregate.Change) error {
 					return d.Ignore(filepath.ToSlash(filepath.Join(relTo, rel)), dir)
 				}
 			}
-			if err := copyTree(c.Path, dstDst, d.Source, d.Target, d.Fsync, d.Verify, d.VerifyRetries, ign, d.Logf); err != nil {
+			// A rename replaces its destination. copyTree merges into an
+			// existing directory, so anything already at the new name has to
+			// go first or entries the source no longer has would survive.
+			if err := os.RemoveAll(dstDst); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			if err := copyTree(c.Path, dstDst, d.Source, d.Target, d.copyOptions(), d.symlinkTargetFor, ign); err != nil {
 				return err
 			}
 		} else if info.Mode()&os.ModeSymlink != 0 {
@@ -1482,8 +1999,15 @@ func (d *Direct) applyRename(ctx context.Context, c aggregate.Change) error {
 				return err
 			}
 		} else if !info.Mode().IsRegular() {
-			d.noteSpecial(relTo, info)
-		} else if err := copyFile(c.Path, dstDst, info, d.Fsync, d.Verify, d.VerifyRetries, d.Logf); err != nil {
+			if d.CopySpecial {
+				if err := makeSpecial(dstDst, info, d.copyOptions()); err != nil {
+					d.noteSpecialError(relTo, err)
+					return nil
+				}
+			} else {
+				d.noteSpecial(relTo, info)
+			}
+		} else if err := copyFile(c.Path, dstDst, info, d.copyOptions()); err != nil {
 			return err
 		}
 	} else if dirty {
@@ -1492,8 +2016,22 @@ func (d *Direct) applyRename(ctx context.Context, c aggregate.Change) error {
 		_ = os.RemoveAll(dstDst)
 	}
 	_ = os.RemoveAll(srcDst)
+	d.removePrevFrom(c)
 	atomic.AddUint64(&d.st.Files, 1)
 	return nil
+}
+
+// removePrevFrom deletes the target copies of earlier rename sources folded
+// into this change. They have no event of their own.
+func (d *Direct) removePrevFrom(c aggregate.Change) {
+	for _, pf := range c.PrevFrom {
+		if pf == c.Path || pf == c.From {
+			continue
+		}
+		if rel, err := d.relInside(pf); err == nil {
+			_ = os.RemoveAll(filepath.Join(d.Target, rel))
+		}
+	}
 }
 
 func (d *Direct) applyOne(ctx context.Context, c aggregate.Change) error {
@@ -1503,14 +2041,29 @@ func (d *Direct) applyOne(ctx context.Context, c aggregate.Change) error {
 	}
 	dst := filepath.Join(d.Target, rel)
 
-	if c.Op&event.Delete != 0 && c.Op&(event.Create|event.Write) == 0 {
-		if !d.DeleteOnRun {
-			return nil
+	if c.Op&event.Delete != 0 && c.Op&event.Create == 0 {
+		d.Logf("debug", "delete %s from=%s prev=%v op=%s", c.Path, c.From, c.PrevFrom, c.Op)
+		if d.DeleteOnRun {
+			if err := os.RemoveAll(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			atomic.AddUint64(&d.st.Deletes, 1)
 		}
-		if err := os.RemoveAll(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
+		// The old name of a rename is not a runtime deletion, even when the
+		// new name was deleted again in the same window (mv a b && rm b).
+		if c.From != "" && c.Op&event.Move != 0 {
+			// If the old name was recreated at the source after the move, its
+			// target copy must stay.
+			if _, statErr := os.Lstat(c.From); errors.Is(statErr, os.ErrNotExist) {
+				if relFrom, err := d.relInside(c.From); err == nil {
+					if err := os.RemoveAll(filepath.Join(d.Target, relFrom)); err != nil && !errors.Is(err, os.ErrNotExist) {
+						return err
+					}
+					atomic.AddUint64(&d.st.Deletes, 1)
+				}
+			}
 		}
-		atomic.AddUint64(&d.st.Deletes, 1)
+		d.removePrevFrom(c)
 		return nil
 	}
 
@@ -1542,12 +2095,61 @@ func (d *Direct) applyOne(ctx context.Context, c aggregate.Change) error {
 		return d.applySymlink(c.Path, dst)
 	}
 	if info.IsDir() {
-		if err := os.MkdirAll(dst, info.Mode().Perm()|0o700); err != nil {
+		if c.Subtree {
+			// A rename split at a filter boundary: the kernel said "moved
+			// here", but the source side was excluded, so the destination has
+			// to be built from the source subtree instead of by renaming the
+			// old target copy. Any pre-existing destination is removed first:
+			// a rename replaces its destination, and whatever is there is not
+			// part of the moved tree.
+			if err := os.RemoveAll(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			var ign func(rel string, dir bool) bool
+			if d.Ignore != nil {
+				// copyTree hands out paths relative to the subtree it walks;
+				// rebase them to the sync root so the exclude rules apply.
+				// relInside already proved c.Path is under the root.
+				base, _ := relInSource(d.Source, c.Path)
+				ign = func(rel string, dir bool) bool {
+					return d.Ignore(filepath.ToSlash(filepath.Join(base, rel)), dir)
+				}
+			}
+			if err := copyTree(c.Path, dst, d.Source, d.Target, d.copyOptions(), d.symlinkTargetFor, ign); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					// Renamed again after the window was taken; the follow-up
+					// move event carries the new name.
+					return nil
+				}
+				return err
+			}
+			atomic.AddUint64(&d.st.Files, 1)
+			return nil
+		}
+		// A file or symlink where a directory belongs is a type change.
+		// MkdirAll would follow a symlink to a directory on some systems.
+		if st, lerr := os.Lstat(dst); lerr == nil && !st.IsDir() {
+			if err := os.RemoveAll(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+		if err := os.MkdirAll(dst, fullModeOf(info.Mode(), d.FullMode)|0o700); err != nil {
 			return err
 		}
+		// Owner/mode/mtime are applied by the batch-level pass after all files
+		// under it have landed; setting them here would be undone by the very
+		// children this batch is about to write.
 		return nil
 	}
 	if !info.Mode().IsRegular() {
+		if d.CopySpecial {
+			if err := makeSpecial(dst, info, d.copyOptions()); err != nil {
+				d.noteSpecialError(rel, err)
+				return nil
+			}
+			atomic.AddUint64(&d.st.Files, 1)
+			return nil
+		}
 		d.noteSpecial(rel, info)
 		if d.DeleteOnRun {
 			return os.RemoveAll(dst)
@@ -1564,12 +2166,20 @@ func (d *Direct) applyOne(ctx context.Context, c aggregate.Change) error {
 	// identical to the stale copy on the target. The event is the authority; the
 	// stat is only a hint for the case where nothing but attributes moved.
 	if c.Op&(event.Write|event.Create) == 0 {
-		if st, serr := os.Stat(dst); serr == nil && st.Size() == info.Size() &&
-			st.ModTime().UnixNano() == truncateMtimeNanos(info.ModTime().UnixNano(), d.mtimeGran) && st.Mode().Perm() == info.Mode().Perm() {
+		// Lstat, and regular only: applyMeta follows symlinks, so a
+		// symlink at the target path must fall through to copyFile and be
+		// replaced instead of having its referent modified.
+		if st, serr := os.Lstat(dst); serr == nil && st.Mode().IsRegular() &&
+			st.Size() == info.Size() &&
+			st.ModTime().UnixNano() == truncateMtimeNanos(info.ModTime().UnixNano(), d.mtimeGran) {
+			// A metadata-only event (chmod/chown/xattr) whose content is
+			// already correct. Apply the metadata without recopying bytes;
+			// mode, owner and xattrs are all handled by applyMeta.
+			applyMeta(c.Path, dst, info, d.copyOptions())
 			return nil
 		}
 	}
-	if err := copyFile(c.Path, dst, info, d.Fsync, d.Verify, d.VerifyRetries, d.Logf); err != nil {
+	if err := copyFile(c.Path, dst, info, d.copyOptions()); err != nil {
 		return err
 	}
 	atomic.AddUint64(&d.st.Files, 1)
@@ -1582,10 +2192,33 @@ func (d *Direct) applyOne(ctx context.Context, c aggregate.Change) error {
 // walk applies: otherwise a single mv of a parent directory would smuggle every
 // *.tmp and cache/ below it onto the target, where a fresh run would never put
 // them.
-func copyTree(src, dst, srcRoot, dstRoot string, fsyncAll, verify bool, retries int, ignore func(rel string, dir bool) bool, logf func(string, string, ...any)) error {
-	return filepath.Walk(src, func(p string, info os.FileInfo, err error) error {
+func copyTree(src, dst, srcRoot, dstRoot string, opts copyOptions, linkFn func(string, string) (string, bool), ignore func(rel string, dir bool) bool) error {
+	// Walk starts with a callback whose error this function ignores (a
+	// subtree may legitimately vanish mid-scan), so a missing source root
+	// would otherwise be a successful no-op after the caller removed the
+	// destination.
+	if _, err := os.Lstat(src); err != nil {
+		return err
+	}
+	// Directories are stamped after their contents: copying a child updates
+	// the parent's mtime, so setting it during the walk would be undone by the
+	// next file. Walk is pre-order, hence the reverse pass.
+	type dirMeta struct {
+		src  string
+		dst  string
+		info os.FileInfo
+	}
+	var dirs []dirMeta
+	walkErr := filepath.Walk(src, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil
+			// A subtree that vanished mid-copy is harmless; a permission or
+			// I/O error is not. The caller removed the old destination, so
+			// reporting success here would leave a silently incomplete
+			// mirror with no event left to repair it.
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
 		}
 		rel, rerr := filepath.Rel(src, p)
 		if rerr != nil {
@@ -1603,30 +2236,107 @@ func copyTree(src, dst, srcRoot, dstRoot string, fsyncAll, verify bool, retries 
 			if lerr != nil {
 				return nil
 			}
-			text, ok := symlinkText(srcRoot, dstRoot, p, link)
+			var text string
+			var ok bool
+			if linkFn != nil {
+				text, ok = linkFn(p, link)
+			} else {
+				switch opts.SymlinkMode {
+				case "skip":
+					ok = false
+				case "all":
+					text, ok = link, true
+				default:
+					text, ok = symlinkText(srcRoot, dstRoot, p, link)
+				}
+			}
 			if !ok {
-				if logf != nil {
-					logf("info", "symlink %s points outside the sync root, not mirrored", p)
+				if opts.Logf != nil {
+					opts.Logf("info", "symlink %s not mirrored (mode %s)", p, opts.SymlinkMode)
 				}
 				return nil
 			}
 			return writeSymlink(out, text)
 		}
 		if info.IsDir() {
-			return os.MkdirAll(out, info.Mode().Perm()|0o700)
+			if st, lerr := os.Lstat(out); lerr == nil && !st.IsDir() {
+				if err := os.RemoveAll(out); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return err
+				}
+			}
+			if err := os.MkdirAll(out, fullModeOf(info.Mode(), opts.FullMode)|0o700); err != nil {
+				return err
+			}
+			dirs = append(dirs, dirMeta{src: p, dst: out, info: info})
+			return nil
 		}
 		if !info.Mode().IsRegular() {
-			if logf != nil {
-				logf("info", "skipping non-regular file %s (mode %s)", p, info.Mode().Type())
+			if opts.CopySpecial {
+				if err := makeSpecial(out, info, opts); err != nil && opts.Logf != nil {
+					opts.Logf("warn", "cannot recreate special file %s: %v (further failures suppressed)", p, err)
+				}
+				return nil
+			}
+			if opts.Logf != nil {
+				opts.Logf("info", "skipping non-regular file %s (mode %s)", p, info.Mode().Type())
 			}
 			return nil
 		}
 		if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
 			return err
 		}
-		return copyFile(p, out, info, fsyncAll, verify, retries, logf)
+		return copyFile(p, out, info, opts)
 	})
+	if walkErr != nil {
+		return walkErr
+	}
+	for i := len(dirs) - 1; i >= 0; i-- {
+		applyMeta(dirs[i].src, dirs[i].dst, dirs[i].info, opts)
+	}
+	return nil
 }
+
+// applyMeta restores owner, mode, xattrs and mtime on one path. It is shared
+// by files and directories so the order (chown clears setuid, ACLs are set
+// after chmod) exists once.
+//
+// It is deliberately best effort: a filesystem that refuses chown or xattr
+// must not turn an otherwise complete copy into a failed batch. The first
+// failure of each kind is logged by a warn-once guard.
+func applyMeta(src, dst string, info os.FileInfo, opts copyOptions) {
+	if opts.Chown {
+		if uid, gid, ok := ownerOf(info); ok {
+			if err := chownPath(dst, uid, gid); err != nil {
+				chownWarn.Do(func() {
+					warnf(opts.Logf, "cannot set owner on %s (further failures suppressed): %v", dst, err)
+				})
+			}
+		}
+	}
+	if opts.Xattrs {
+		// Make the inode writable for setxattr if its current mode is not;
+		// the final chmod below restores the source mode regardless.
+		if st, err := os.Stat(dst); err == nil && st.Mode().Perm()&0o200 == 0 {
+			_ = os.Chmod(dst, st.Mode()|0o200)
+		}
+		if err := copyXattrs(src, dst); err != nil {
+			xattrWarn.Do(func() {
+				warnf(opts.Logf, "cannot copy extended attributes for %s (further failures suppressed): %v", dst, err)
+			})
+		}
+	}
+	if err := os.Chmod(dst, fullModeOf(info.Mode(), opts.FullMode)); err != nil {
+		chmodWarn.Do(func() {
+			warnf(opts.Logf, "cannot set permissions on %s (further failures suppressed): %v", dst, err)
+		})
+	}
+	if err := os.Chtimes(dst, info.ModTime(), info.ModTime()); err != nil {
+		chtimesWarn.Do(func() {
+			warnf(opts.Logf, "cannot set mtime on %s (further failures suppressed): %v", dst, err)
+		})
+	}
+}
+
 
 // symlinkText returns the link text to write on the target. Links resolving
 // inside srcRoot are mirrored (absolute ones rewritten under dstRoot); links

@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,8 +38,36 @@ type RSync struct {
 	// SSH indicates the rsyncssh dialect.
 	SSH     bool
 	SSHOpts SSHOptions
+	// Remote says the destination is reached through rsync's remote syntax
+	// (host:path, host::module, rsync://) rather than being a local path.
+	// It is separate from SSH because mode = "rsync" can also name a remote
+	// target, and local filesystem operations such as RemoveAll are then
+	// meaningless. Keeping the two apart is what makes runtime deletion work
+	// for both dialects instead of silently acting on a local path named
+	// "host:path".
+	Remote bool
 	// Extra arguments appended verbatim before the source/target pair.
 	Extra []string
+	// Binary overrides the rsync executable (GSYNCD_RSYNC still wins for
+	// tests, since that is how a fake rsync is injected).
+	Binary string
+	// BWLimit is the transfer cap in bytes per second; rsync's own unit is
+	// KiB per second.
+	BWLimit int64
+	Compress     bool
+	Xattrs       bool
+	ACLs         bool
+	HardLinks    bool
+	Chown        string
+	Chmod        string
+	PasswordFile string
+	RsyncPath    string
+	// DeleteExcluded removes excluded destination entries on a whole-tree
+	// transfer. Ignored on incremental runs.
+	DeleteExcluded bool
+	// SymlinkMode mirrors the direct backend: safe adds --safe-links, all
+	// leaves rsync's default -l, skip adds --no-links.
+	SymlinkMode string
 	// Delete enables deletion on the target at all.
 	Delete bool
 	// DeleteOnStartup adds --delete to the initial whole-tree transfer; it is
@@ -49,8 +79,8 @@ type RSync struct {
 	// BatchLimit splits large windows into several invocations.
 	BatchLimit int
 	// TargetGuard refuses to write unless a local target already exists and
-	// is on a real mount or carries the marker. It is skipped for rsyncssh,
-	// where Target names a host rather than a path.
+	// is on a real mount or carries the marker. It is skipped for remote
+	// targets, where Target names a host and path on another machine.
 	TargetGuard bool
 	// targetInfo is the identity captured at Startup; Apply re-checks it so a
 	// target moved or replaced at runtime is not recreated and filled.
@@ -97,6 +127,11 @@ func NewRSync(source, target string, del bool, extra []string, logf func(string,
 	}
 }
 
+// remote reports whether the destination has to be reached through rsync's
+// remote protocol. Both dialects count: rsyncssh always does, and mode = "rsync"
+// does when the target carries a host part.
+func (r *RSync) remote() bool { return r.SSH || r.Remote }
+
 // Name implements Backend.
 func (r *RSync) Name() string {
 	if r.SSH {
@@ -124,14 +159,20 @@ func (r *RSync) Stats() Stats {
 func (r *RSync) Close() error { return nil }
 
 func (r *RSync) binary() string {
+	// The environment variable stays first so a test or a rescue shell can
+	// replace the binary without editing the configuration.
 	if b := os.Getenv("GSYNCD_RSYNC"); b != "" {
 		return b
+	}
+	if r.Binary != "" {
+		return r.Binary
 	}
 	return "rsync"
 }
 
-// baseArgs builds the arguments shared by every invocation.
-func (r *RSync) baseArgs() []string {
+// commonArgs builds the flags shared by every whole-tree or incremental
+// transfer. It does not include --files-from or the source/target operands.
+func (r *RSync) commonArgs() []string {
 	// -r is explicit on purpose. rsync's own manual says the --files-from
 	// exception is the one case where -a does not imply -r:
 	//
@@ -142,20 +183,80 @@ func (r *RSync) baseArgs() []string {
 	// never descend into them, so a directory that appeared at runtime (and
 	// whose children are represented only by that single path) would arrive
 	// empty. The original lsyncd passed -r here as well.
-	args := []string{"-a", "-r", "--from0", "--files-from=-"}
-	// --safe-links makes rsync ignore symlinks whose target escapes the copied
-	// tree, matching the direct backend's "internal links only" rule.
-	args = append(args, "--safe-links", "--exclude="+TargetMarkerName)
+	args := []string{"-a", "-r"}
+	switch r.SymlinkMode {
+	case "skip":
+		args = append(args, "--no-links")
+	case "all":
+		// rsync's default -l copies the link text verbatim, including links
+		// pointing outside the tree; that is the faithful "all" mode.
+	default:
+		// --safe-links makes rsync ignore symlinks whose target escapes the
+		// copied tree, matching the direct backend's "internal links only"
+		// default.
+		args = append(args, "--safe-links")
+	}
+	if r.DeleteExcluded {
+		// --delete-excluded overrides --exclude and would remove the target
+		// guard marker, which exists only on the target. A protect rule keeps
+		// it while still excluding it from the transfer.
+		args = append(args, "--filter=P "+TargetMarkerName)
+	}
+	args = append(args, "--exclude="+TargetMarkerName)
+	if r.Compress {
+		args = append(args, "--compress")
+	}
+	if r.Xattrs {
+		args = append(args, "--xattrs")
+	}
+	if r.ACLs {
+		args = append(args, "--acls")
+	}
+	if r.HardLinks {
+		args = append(args, "--hard-links")
+	}
+	if r.BWLimit > 0 {
+		// rsync's unit is KiB per second; a sub-KiB request must not become
+		// 0, which rsync reads as "unlimited".
+		kib := r.BWLimit / 1024
+		if kib < 1 {
+			kib = 1
+		}
+		args = append(args, fmt.Sprintf("--bwlimit=%d", kib))
+	}
+	if r.Chown != "" {
+		args = append(args, "--chown="+r.Chown)
+	}
+	if r.Chmod != "" {
+		args = append(args, "--chmod="+r.Chmod)
+	}
+	if r.PasswordFile != "" {
+		args = append(args, "--password-file="+r.PasswordFile)
+	}
+	if r.RsyncPath != "" {
+		args = append(args, "--rsync-path="+r.RsyncPath)
+	}
 	// Keep the transfer restartable after an interruption: a 100 TB tree must
 	// not begin again from zero because one batch failed.
 	args = append(args, "--partial", "--partial-dir=.rsync-partial")
+	return args
+}
+
+// baseArgs builds the arguments shared by every incremental invocation.
+func (r *RSync) baseArgs() []string {
+	args := r.commonArgs()
+	args = append(args, "--from0", "--files-from=-")
 	// --delete is deliberately absent here: an incremental run carries only the
 	// changed paths, and rsync would then consider everything else extraneous
 	// (see deleteList). Only Startup, which mirrors the whole tree, adds it.
 	if r.SSH {
 		args = append(args, r.rshArg())
 	}
-	args = append(args, r.Extra...)
+	// A user-supplied --delete in rsync_extra would turn an incremental
+	// --files-from run into "delete everything not in this batch". It is
+	// stripped here and added only by the whole-tree paths, which know what
+	// they are mirroring.
+	args = append(args, withoutDeleteFlags(r.Extra)...)
 	args = append(args, r.excludeArgs()...)
 	return args
 }
@@ -240,7 +341,7 @@ func (r *RSync) dest() string {
 
 // Startup performs the initial transfer of the whole tree.
 func (r *RSync) Startup(ctx context.Context) error {
-	if r.TargetGuard && !r.SSH && !strings.Contains(r.Target, ":") {
+	if r.TargetGuard && !r.remote() {
 		if err := CheckTarget(r.Target); err != nil {
 			return err
 		}
@@ -262,12 +363,15 @@ func (r *RSync) Startup(ctx context.Context) error {
 	}
 	if r.Delete && r.DeleteOnStartup {
 		filtered = append(filtered, "--delete")
+		if r.DeleteExcluded {
+			filtered = append(filtered, "--delete-excluded")
+		}
 	}
 	filtered = append(filtered, src, r.dest())
 	if err := r.run(ctx, filtered, nil); err != nil {
 		return err
 	}
-	if r.Delete && r.DeleteOnStartup && !r.SSH {
+	if r.Delete && r.DeleteOnStartup && !r.remote() {
 		if err := r.removeExtras(ctx); err != nil {
 			r.Logf("warn", "prune: %v", err)
 		}
@@ -315,6 +419,249 @@ func (r *RSync) removeExtras(ctx context.Context) error {
 	})
 }
 
+// uploadSubtree mirrors one whole directory that a filter split turned into a
+// Create. Unlike an ordinary batch it does not use --files-from: the point is
+// to walk the directory recursively, and --delete (when deletion is enabled)
+// makes the destination match the moved subtree instead of keeping entries the
+// source no longer has.
+func (r *RSync) uploadSubtree(ctx context.Context, c aggregate.Change) error {
+	rel, ok := relInSource(r.Source, c.Path)
+	if !ok {
+		return nil
+	}
+	// Do not destroy the destination for a source that is already gone. The
+	// move event named it, but a race with a delete is possible; removing
+	// first and then failing to upload would leave the mirror emptier than
+	// either side of the race.
+	if _, err := os.Lstat(c.Path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// The path was renamed again after this window was taken. The
+			// follow-up move carries the new name; failing here would re-add
+			// this stale Subtree change forever and block the whole root.
+			return nil
+		}
+		return err
+	}
+	// A rename replaces its destination. Remove it first, exactly as the
+	// direct backend does, instead of asking rsync for a scoped --delete.
+	if err := r.removeDest(ctx, c.Path); err != nil {
+		return err
+	}
+	// Transfer through the normal sync-root-relative path list. Running rsync
+	// with the moved subtree as its transfer root would re-base anchored
+	// exclude patterns (/ok/moved/secret/) and silently copy content that the
+	// same configuration excludes in direct mode.
+	return r.upload(ctx, []string{filepath.ToSlash(rel)})
+}
+
+// removeDest deletes one destination path, local or remote.
+func (r *RSync) removeDest(ctx context.Context, abs string) error {
+	rel, ok := relInSource(r.Source, abs)
+	if !ok {
+		return nil
+	}
+	if r.remote() {
+		return r.remoteDelete(ctx, []string{filepath.ToSlash(rel)})
+	}
+	if err := os.RemoveAll(filepath.Join(r.Target, rel)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// shellQuote wraps s in single quotes so a remote shell treats it as one word.
+// Single quotes inside are closed, escaped and reopened, which is the only
+// portable way to pass an arbitrary path.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+// sshPath returns the absolute remote path for a source-relative path.
+func (r *RSync) sshPath(rel string) string {
+	dir := r.TargetDir
+	if dir == "" {
+		dir = r.Source
+	}
+	return path.Join(dir, rel)
+}
+
+// sshRun executes a shell script on the remote host through ssh's stdin.
+// Sending the script on stdin (sh -s) avoids the ARG_MAX ceiling that a
+// command-line list of paths would hit on a large rename or delete batch.
+func (r *RSync) sshRun(ctx context.Context, script string) error {
+	bin := r.SSHOpts.Binary
+	if bin == "" {
+		bin = "ssh"
+	}
+	args := make([]string, 0, 8+len(r.SSHOpts.Extra))
+	if r.SSHOpts.Port > 0 {
+		args = append(args, "-p", strconv.Itoa(r.SSHOpts.Port))
+	}
+	if r.SSHOpts.IdentityFile != "" {
+		args = append(args, "-i", r.SSHOpts.IdentityFile)
+	}
+	args = append(args, "-o", "BatchMode=yes")
+	args = append(args, r.SSHOpts.Extra...)
+	args = append(args, r.Target, "sh -s")
+	timeout := r.Timeout
+	if timeout <= 0 {
+		timeout = time.Hour
+	}
+	return Run(ctx, RunConfig{
+		Path:      bin,
+		Args:      args,
+		Stdin:     strings.NewReader(script),
+		Timeout:   timeout,
+		MaxStderr: 8192,
+	})
+}
+
+// sshMoveChanges renames every path on the remote host in one ssh invocation.
+// It is the rsyncssh optimisation the original lsyncd is known for: a
+// directory rename costs a remote mv, not a retransfer of the whole tree.
+// Ancestors are moved first, so a child rename inside a renamed directory
+// still finds its source.
+func (r *RSync) sshMoveChanges(ctx context.Context, changes []aggregate.Change) bool {
+	type moveOp struct {
+		src string
+		dst string
+	}
+	ops := make([]moveOp, 0, len(changes))
+	for _, c := range changes {
+		if c.From == "" || c.Op&event.Delete != 0 {
+			continue
+		}
+		if c.Op&(event.Create|event.Write|event.Attrib) != 0 {
+			// The rename carries content or metadata that only rsync can
+			// apply; moving the old remote file would keep the stale copy.
+			continue
+		}
+		fromRel, ok1 := relInSource(r.Source, c.From)
+		toRel, ok2 := relInSource(r.Source, c.Path)
+		if !ok1 || !ok2 {
+			// A path outside the root is a routing error, not a move this
+			// invocation can take responsibility for.
+			return false
+		}
+		ops = append(ops, moveOp{
+			src: r.sshPath(filepath.ToSlash(fromRel)),
+			dst: r.sshPath(filepath.ToSlash(toRel)),
+		})
+	}
+	if len(ops) == 0 {
+		return false
+	}
+	// A batch of rm+mv operations is only safe when none of the paths can
+	// destroy another operation's source or destination. Two moves into
+	// nested destinations, a chain a->b, b->c, or a destination under another
+	// move's source would otherwise silently lose data.
+	srcSet := make(map[string]bool, len(ops))
+	dstSet := make(map[string]bool, len(ops))
+	for _, op := range ops {
+		srcSet[op.src] = true
+		dstSet[op.dst] = true
+	}
+	for _, op := range ops {
+		if srcSet[op.dst] || hasStrictAncestor(srcSet, op.dst) ||
+			dstSet[op.src] || hasStrictAncestor(dstSet, op.src) ||
+			hasStrictAncestor(dstSet, op.dst) {
+			r.Logf("debug", "%s: overlapping renames, falling back to rsync", r.Name())
+			return false
+		}
+	}
+	sort.SliceStable(ops, func(i, j int) bool {
+		di := strings.Count(ops[i].src, "/")
+		dj := strings.Count(ops[j].src, "/")
+		if di != dj {
+			return di < dj
+		}
+		return ops[i].src < ops[j].src
+	})
+	var b strings.Builder
+	b.WriteString("set -e\n")
+	for _, op := range ops {
+		// `mv a b` nests a inside b when b is an existing directory; a
+		// rename replaces its destination. Remove the destination first.
+		b.WriteString("rm -rf -- ")
+		b.WriteString(shellQuote(op.dst))
+		b.WriteByte('\n')
+		b.WriteString("mkdir -p -- ")
+		b.WriteString(shellQuote(path.Dir(op.dst)))
+		b.WriteString("\n")
+		b.WriteString("mv -f -- ")
+		b.WriteString(shellQuote(op.src))
+		b.WriteByte(' ')
+		b.WriteString(shellQuote(op.dst))
+		b.WriteByte('\n')
+	}
+	if err := r.sshRun(ctx, b.String()); err != nil {
+		r.Logf("debug", "%s: remote move failed, falling back to rsync: %v", r.Name(), err)
+		return false
+	}
+	return true
+}
+
+// hasStrictAncestor reports whether any proper ancestor of p is in set.
+func hasStrictAncestor(set map[string]bool, p string) bool {
+	for {
+		if p == "/" {
+			return false
+		}
+		i := strings.LastIndexByte(p, '/')
+		if i < 0 {
+			return false
+		}
+		if i == 0 {
+			return set["/"]
+		}
+		p = p[:i]
+		if set[p] {
+			return true
+		}
+	}
+}
+
+// sshDeleteChanges removes paths on the remote host with rm -rf in one ssh
+// invocation. A directory rename whose old subtree still exists is the common
+// case this makes free; falling back to rsync --delete-missing-args is correct
+// but much slower.
+func (r *RSync) sshDeleteChanges(ctx context.Context, changes []aggregate.Change) bool {
+	var b strings.Builder
+	b.WriteString("set -e\n")
+	n := 0
+	for _, c := range changes {
+		if c.Op&event.Delete == 0 || c.Op&(event.Create|event.Write) != 0 {
+			continue
+		}
+		paths := []string{c.Path}
+		if c.From != "" && c.Op&event.Move != 0 {
+			// mv a b && rm b: both names are gone at the source.
+			paths = append(paths, c.From)
+		}
+		paths = append(paths, c.PrevFrom...)
+		for _, p := range paths {
+			rel, ok := relInSource(r.Source, p)
+			if !ok {
+				// Same reasoning as sshMoveChanges: a path outside the root
+				// must not be reported as handled by a skipped invocation.
+				return false
+			}
+			b.WriteString("rm -rf -- ")
+			b.WriteString(shellQuote(r.sshPath(filepath.ToSlash(rel))))
+			b.WriteByte('\n')
+			n++
+		}
+	}
+	if n == 0 {
+		return false
+	}
+	if err := r.sshRun(ctx, b.String()); err != nil {
+		r.Logf("debug", "%s: remote delete failed, falling back to rsync: %v", r.Name(), err)
+		return false
+	}
+	return true
+}
+
 // Apply implements Backend by streaming the changed relative paths to rsync.
 func (r *RSync) Apply(ctx context.Context, b Batch) error {
 	if b.Full {
@@ -323,7 +670,7 @@ func (r *RSync) Apply(ctx context.Context, b Batch) error {
 	if len(b.Changes) == 0 {
 		return nil
 	}
-	if r.TargetGuard && !r.SSH && !strings.Contains(r.Target, ":") && r.targetInfo != nil {
+	if r.TargetGuard && !r.remote() && r.targetInfo != nil {
 		st, err := os.Stat(r.Target)
 		if err != nil {
 			return fmt.Errorf("target %s disappeared while running, refusing to write: %w", r.Target, err)
@@ -338,6 +685,7 @@ func (r *RSync) Apply(ctx context.Context, b Batch) error {
 	// contents before the new contents are uploaded. rsync's incremental path
 	// has no --delete, so that removal is explicit and happens first.
 	if r.DeleteOnRun {
+		var remoteRecreates []string
 		for _, c := range b.Changes {
 			if !c.Recreate {
 				continue
@@ -346,19 +694,108 @@ func (r *RSync) Apply(ctx context.Context, b Batch) error {
 			if !ok {
 				continue
 			}
-			if r.SSH {
-				if err := r.deleteList(ctx, []string{c.Path}); err != nil {
-					return err
-				}
+			if r.remote() {
+				remoteRecreates = append(remoteRecreates, c.Path)
 				continue
 			}
 			if err := os.RemoveAll(filepath.Join(r.Target, rel)); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
 		}
+		// One rsync invocation for all recreated directories, not one temp
+		// dir and child process per directory.
+		if err := r.deleteList(ctx, remoteRecreates); err != nil {
+			return err
+		}
 	}
 
-	uploads, deletes := r.plan(b.Changes)
+	// rsyncssh can do moves and deletes on the target host itself. That is
+	// the whole point of the dialect: a directory rename becomes a remote mv
+	// instead of a retransfer. A change that also carries content (a write
+	// folded into a rename) is left to rsync, because mv would move the stale
+	// remote copy.
+	work := b.Changes
+	if r.SSH {
+		var moves, dels []aggregate.Change
+		var moveIdx, delIdx []int
+		for i, c := range work {
+			switch {
+			case c.From != "" && len(c.PrevFrom) == 0 &&
+				c.Op&event.Delete == 0 && c.Op&(event.Create|event.Write|event.Attrib) == 0:
+				// A rename is not a deletion: it has to be applied even when
+				// delete = "startup" forbids runtime removals, otherwise the
+				// old name would stay on the target as a duplicate. A change
+				// with several old names is left to plan(), which can delete
+				// all of them.
+				moves = append(moves, c)
+				moveIdx = append(moveIdx, i)
+			case r.DeleteOnRun && c.Op&event.Delete != 0 && c.Op&(event.Create|event.Write) == 0:
+				dels = append(dels, c)
+				delIdx = append(delIdx, i)
+			}
+		}
+		handled := make(map[int]bool, len(moveIdx)+len(delIdx))
+		if r.sshMoveChanges(ctx, moves) {
+			for _, i := range moveIdx {
+				handled[i] = true
+			}
+			atomic.AddUint64(&r.st.Files, uint64(len(moves)))
+		}
+		if r.sshDeleteChanges(ctx, dels) {
+			for _, i := range delIdx {
+				handled[i] = true
+			}
+			atomic.AddUint64(&r.st.Deletes, uint64(len(dels)))
+		}
+		if len(handled) > 0 {
+			filtered := make([]aggregate.Change, 0, len(work)-len(handled))
+			for i, c := range work {
+				if !handled[i] {
+					filtered = append(filtered, c)
+				}
+			}
+			work = filtered
+		}
+	}
+
+	// A directory moved out of an excluded path is represented as a subtree
+	// Create. It needs its own recursive invocation because --files-from
+	// semantics only list paths; the subtree contents were never events.
+	for _, c := range work {
+		if !c.Subtree || c.Kind != aggregate.KindDir || c.Op&event.Create == 0 {
+			continue
+		}
+		if err := r.uploadSubtree(ctx, c); err != nil {
+			atomic.AddUint64(&r.st.Errors, 1)
+			return err
+		}
+		atomic.AddUint64(&r.st.Files, 1)
+	}
+
+	uploads, deletes, moveDeletes := r.plan(work)
+	// A rename chain (mv a b; mv c a) leaves a as both an upload destination
+	// and the old name of another rename. Deleting it would remove the file
+	// that was just uploaded; the final source state says it exists.
+	if len(moveDeletes) > 0 {
+		uploaded := make(map[string]bool, len(uploads))
+		for _, u := range uploads {
+			uploaded[u] = true
+		}
+		kept := make([]string, 0, len(moveDeletes))
+		for _, md := range moveDeletes {
+			if rel, ok := relInSource(r.Source, md); ok && uploaded[filepath.ToSlash(rel)] {
+				continue
+			}
+			// The old name may have been recreated at the source after the
+			// move (a rename chain, or a new file at the same path). Deleting
+			// the target copy would remove content the source still has.
+			if _, err := os.Lstat(md); err == nil {
+				continue
+			}
+			kept = append(kept, md)
+		}
+		moveDeletes = kept
+	}
 	// Exit 23 means some paths could not be read or transferred. It is not
 	// fatal to the invocation (the rest of the batch did land), but the batch
 	// must be reported so the engine re-adds those paths: silently treating it
@@ -391,19 +828,40 @@ func (r *RSync) Apply(ctx context.Context, b Batch) error {
 			atomic.AddUint64(&r.st.Files, uint64(end-start))
 		}
 	}
+	deleteSet := func(list []string) error {
+		if len(list) == 0 {
+			return nil
+		}
+		err := r.deleteList(ctx, list)
+		if err == nil {
+			atomic.AddUint64(&r.st.Deletes, uint64(len(list)))
+			return nil
+		}
+		if r.benignExit(err) {
+			if ExitCode(err) == 23 && partial == nil {
+				partial = err
+			}
+			atomic.AddUint64(&r.st.Deletes, uint64(len(list)))
+			return nil
+		}
+		atomic.AddUint64(&r.st.Errors, 1)
+		return err
+	}
+	if partial != nil {
+		// The new name of a rename may not have landed (exit 23/24). Removing
+		// the old name now could leave neither copy; retry the batch first.
+		return partial
+	}
+	// The old name of a rename is not a runtime deletion: it is removed even
+	// when delete = "startup" suppresses ordinary deletes.
+	if err := deleteSet(moveDeletes); err != nil {
+		return err
+	}
 	if len(deletes) > 0 {
 		if r.DeleteOnRun {
-			if err := r.deleteList(ctx, deletes); err != nil {
-				if r.benignExit(err) {
-					if ExitCode(err) == 23 && partial == nil {
-						partial = err
-					}
-				} else {
-					atomic.AddUint64(&r.st.Errors, 1)
-					return err
-				}
+			if err := deleteSet(deletes); err != nil {
+				return err
 			}
-			atomic.AddUint64(&r.st.Deletes, uint64(len(deletes)))
 		} else if !r.dropWarned {
 			// delete = "startup" means runtime removals are intentionally not
 			// mirrored. That is a legitimate configuration, but a batch full of
@@ -430,10 +888,22 @@ func (r *RSync) Apply(ctx context.Context, b Batch) error {
 // so the new name is transferred and the old name has to be removed explicitly;
 // otherwise every "mv a b" leaves a duplicate of a on the target forever. The
 // direct backend renames in place, and this is what keeps the two equivalent.
-func (r *RSync) plan(changes []aggregate.Change) (uploads, deletes []string) {
+func (r *RSync) plan(changes []aggregate.Change) (uploads, deletes, moveDeletes []string) {
 	for _, c := range changes {
-		if c.Op&event.Delete != 0 && c.Op&(event.Create|event.Write) == 0 {
+		// Subtree Creates were already mirrored by uploadSubtree; listing them
+		// here as well would send the same directory twice.
+		if c.Subtree {
+			continue
+		}
+		if c.Op&event.Delete != 0 && c.Op&event.Create == 0 {
+			// A path written and then deleted inside one window ends deleted;
+			// the Write bit must not turn it into an upload.
 			deletes = append(deletes, c.Path)
+			if c.From != "" && c.Op&event.Move != 0 {
+				// mv a b && rm b leaves neither name at the source.
+				moveDeletes = append(moveDeletes, c.From)
+			}
+			moveDeletes = append(moveDeletes, c.PrevFrom...)
 			continue
 		}
 		rel, ok := relInSource(r.Source, c.Path)
@@ -442,10 +912,14 @@ func (r *RSync) plan(changes []aggregate.Change) (uploads, deletes []string) {
 		}
 		uploads = append(uploads, filepath.ToSlash(rel))
 		if c.From != "" && c.Op&event.Move != 0 {
-			deletes = append(deletes, c.From)
+			// The old name of a rename is not a runtime deletion. It has to
+			// disappear even under delete = "startup", or a failed ssh fast
+			// path would leave a duplicate that no later event removes.
+			moveDeletes = append(moveDeletes, c.From)
 		}
+		moveDeletes = append(moveDeletes, c.PrevFrom...)
 	}
-	return uploads, deletes
+	return uploads, deletes, moveDeletes
 }
 
 func (r *RSync) upload(ctx context.Context, rels []string) error {
@@ -456,34 +930,62 @@ func (r *RSync) upload(ctx context.Context, rels []string) error {
 	return r.run(ctx, args, reader)
 }
 
-// deleteArgs builds the remote deletion invocation.
+// remoteDelete removes the listed relative paths on a remote target.
 //
-// Two traps were measured on a real target and both are load bearing:
+// It runs rsync against an empty temporary source and lists the paths with
+// --delete-missing-args. Two traps are load bearing:
 //
 //   - --delete must NOT appear. Combined with --files-from it makes rsync
 //     treat every destination entry absent from the list as extraneous, so
 //     deleting one file would wipe the rest of a 100 TB mirror.
 //     --delete-missing-args removes exactly the listed paths.
 //
+//   - The source must be empty. Pointing at the sync source would make every
+//     listed path that still exists there a transfer, not a deletion; that is
+//     the Recreate and Subtree case, where the old destination has to go
+//     before the new content arrives.
+//
 //   - --force must appear. Without it rsync prints "cannot delete non-empty
 //     directory: keep" and still exits 0, so a renamed directory silently
 //     leaves its entire old subtree behind and the mirror drifts. With it the
 //     listed directory is removed together with its contents, which is what a
 //     local target's RemoveAll does.
-func (r *RSync) deleteArgs() []string {
-	args := []string{"-a", "--delete-missing-args", "--force", "--from0", "--files-from=-"}
-	if rsh := r.rshArg(); rsh != "" {
-		args = append(args, rsh)
+func (r *RSync) remoteDelete(ctx context.Context, rels []string) error {
+	if len(rels) == 0 {
+		return nil
 	}
-	args = append(args, withoutDeleteFlags(r.Extra)...)
-	return append(args, strings.TrimSuffix(r.Source, string(filepath.Separator))+string(filepath.Separator), r.dest())
+	empty, err := os.MkdirTemp("", "gsyncd-del-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(empty)
+	args := r.deleteArgs()
+	args = append(args, empty+string(filepath.Separator), r.dest())
+	return r.run(ctx, args, newNulReader(rels))
+}
+
+// deleteArgs builds the flags shared by the remote deletion invocation.
+func (r *RSync) deleteArgs() []string {
+	// -r is explicit: with --files-from, -a does not imply -r, and a listed
+	// directory that is not recursed is never removed with its contents.
+	args := []string{"-a", "-r", "--delete-missing-args", "--force", "--from0", "--files-from=-"}
+	if r.SSH {
+		args = append(args, r.rshArg())
+	}
+	if r.PasswordFile != "" {
+		args = append(args, "--password-file="+r.PasswordFile)
+	}
+	if r.RsyncPath != "" {
+		args = append(args, "--rsync-path="+r.RsyncPath)
+	}
+	return append(args, withoutDeleteFlags(r.Extra)...)
 }
 
 // deleteList removes paths on the target. For a local target this is a plain
 // unlink, which is both faster and more accurate than an rsync run; for a
-// remote target rsync --delete-missing-args is used when available.
+// remote target rsync --delete-missing-args is used.
 func (r *RSync) deleteList(ctx context.Context, abs []string) error {
-	if r.SSH {
+	if r.remote() {
 		rels := make([]string, 0, len(abs))
 		for _, p := range abs {
 			rel, ok := relInSource(r.Source, p)
@@ -492,7 +994,7 @@ func (r *RSync) deleteList(ctx context.Context, abs []string) error {
 			}
 			rels = append(rels, filepath.ToSlash(rel))
 		}
-		return r.run(ctx, r.deleteArgs(), newNulReader(rels))
+		return r.remoteDelete(ctx, rels)
 	}
 	var firstErr error
 	for _, p := range abs {

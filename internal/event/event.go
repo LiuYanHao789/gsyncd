@@ -38,6 +38,18 @@ const (
 	Close
 )
 
+// Subtree is not an Op. It is a flag on an Event that tells the backend a
+// directory Create must be mirrored with its entire content.
+//
+// The engine synthesises it when a rename crosses a filter boundary: the
+// source side is excluded but the destination side is not, so the kernel's
+// Move cannot be applied as a rename (the excluded content must not be
+// carried over by moving the target copy). Instead the destination is treated
+// as a new directory whose whole subtree has to be copied. A plain directory
+// Create only creates the directory entry, which is why this cannot be
+// inferred from the Op mask; keeping it on the Event makes it survive the
+// aggregator unchanged.
+
 // String renders an op mask in a stable, log friendly form.
 //
 // Combinations are rendered as "Create|Write" rather than "Op(?)": the backfill
@@ -88,4 +100,8 @@ type Event struct {
 	Cookie uint32
 	// At is the wall clock time the watcher observed the event.
 	At time.Time
+	// Subtree marks a directory Create that has to be mirrored together with
+	// everything below it. The engine sets it when a rename is split at a
+	// filter boundary; see the block comment above the Op constants.
+	Subtree bool
 }

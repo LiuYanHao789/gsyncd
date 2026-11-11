@@ -100,8 +100,8 @@ type Sync struct {
 	// exists for files that are never quiet: an append-only log or a database
 	// file that is written to continuously produces events forever, so the
 	// delay never expires and the mirror would stay at the first snapshot
-	// until the writer exits (issues #77, #458). Zero keeps the historical
-	// behaviour of waiting for silence.
+	// until the writer exits (issues #77, #458). Zero uses the engine default
+	// (15m); a negative value disables the bound.
 	MaxHold time.Duration
 	Delete  bool
 	// CloseWrite holds a flush back until every pending file has been closed
@@ -117,10 +117,72 @@ type Sync struct {
 	// DeleteMode is "", "startup" or "running". It distinguishes "mirror the
 	// source exactly, always" from the two half modes lsyncd also offers.
 	DeleteMode string
+	// Remote forces the destination to be treated as an rsync remote
+	// endpoint. It is normally inferred from the target syntax (host:path,
+	// host::module, rsync://), and the override exists for targets that
+	// contain a colon but are local paths on a particular platform.
+	Remote bool
+	// remoteSet records that the operator wrote remote = ... explicitly.
+	// Without it, remote = false would be indistinguishable from "not set",
+	// and the automatic inference could never be overridden.
+	remoteSet bool
 	// Excludes are rsync style patterns applied to the watcher.
 	Excludes []string
+	// ExcludeFrom lists files of additional exclude patterns, read relative
+	// to the configuration file. They are prepended to the inline list so an
+	// inline "!pattern" can re-include something a file excluded.
+	ExcludeFrom []string
 	// RSyncExtra are literal extra rsync arguments.
 	RSyncExtra []string
+	// Structured rsync options. They exist so the common flags do not have to
+	// be written as raw --flags, and so a typo is a configuration error rather
+	// than a flag rsync silently ignores. RSyncExtra remains the escape hatch.
+	RSyncBinary       string
+	RSyncBWLimit      int64
+	RSyncCompress     bool
+	RSyncXattrs       bool
+	RSyncACLs         bool
+	RSyncHardLinks    bool
+	RSyncChown        string
+	RSyncChmod        string
+	RSyncPasswordFile string
+	RSyncPath         string
+	RSyncDeleteExcluded bool
+
+	// PreserveOwner controls uid/gid copying in the direct backend:
+	// "auto" (default) copies them only when running as root, "true" always
+	// tries, "false" never does. A failure is a warning, never a failed copy.
+	PreserveOwner string
+	// PreserveMode selects how much of the permission word is restored.
+	// "full" (default) keeps setuid/setgid/sticky, "basic" keeps the low 9
+	// bits only.
+	PreserveMode string
+	// SymlinkMode is "safe" (default, only links resolving inside the sync
+	// root), "all" (copy the link text verbatim) or "skip".
+	SymlinkMode string
+	// DelayMode is "quiet" (default, flush after the whole tree has been
+	// quiet for Delay) or "deadline" (flush when the oldest pending change is
+	// Delay old, which is what lsyncd does under continuous writes).
+	DelayMode string
+	// FullResync overrides the global periodic full resync for this sync.
+	// Zero inherits the global value.
+	FullResync time.Duration
+
+	// PreserveXattrs copies extended attributes (which include POSIX ACLs on
+	// Linux). Off by default: it needs privileges for security.* names and a
+	// target filesystem that supports them.
+	PreserveXattrs bool
+	// PreserveHardlinks recreates hardlink groups inside one initial pass.
+	// Off by default; cross-batch groups are copied independently.
+	PreserveHardlinks bool
+	// Sparse preserves holes for regular files on Linux. Off by default.
+	Sparse bool
+	// CopySpecial recreates FIFOs and device nodes instead of skipping them.
+	// Needs root for device nodes.
+	CopySpecial bool
+	// BandwidthLimit caps direct copy throughput in bytes per second. The
+	// rsync backends receive it as --bwlimit.
+	BandwidthLimit int64
 
 	// MaxProcesses is the per-sync cap; 0 means inherit the global one.
 	MaxProcesses int
@@ -384,6 +446,10 @@ func applySync(t tomlTable) (Sync, error) {
 		BatchLimit:    10_000,
 		Verify:        true,
 		VerifyRetries: 2,
+		PreserveOwner: "auto",
+		PreserveMode:  "full",
+		SymlinkMode:   "safe",
+		DelayMode:     "quiet",
 	}
 	for k, v := range t {
 		switch normKey(k) {
@@ -427,10 +493,35 @@ func applySync(t tomlTable) (Sync, error) {
 			default:
 				return s, fmt.Errorf("delete: expected bool or string")
 			}
+		case "remote":
+			s.Remote = asBool(v)
+			s.remoteSet = true
 		case "exclude", "excludes":
 			s.Excludes = asStrings(v)
 		case "rsyncopts", "rsyncextra":
 			s.RSyncExtra = asStrings(v)
+		case "rsyncbinary":
+			s.RSyncBinary = asString(v)
+		case "rsyncbwlimit":
+			s.RSyncBWLimit = asBytes(v)
+		case "rsynccompress":
+			s.RSyncCompress = asBool(v)
+		case "rsyncxattrs":
+			s.RSyncXattrs = asBool(v)
+		case "rsyncacls":
+			s.RSyncACLs = asBool(v)
+		case "rsynchardlinks":
+			s.RSyncHardLinks = asBool(v)
+		case "rsyncchown":
+			s.RSyncChown = asString(v)
+		case "rsyncchmod":
+			s.RSyncChmod = asString(v)
+		case "rsyncpasswordfile":
+			s.RSyncPasswordFile = asString(v)
+		case "rsyncpath":
+			s.RSyncPath = asString(v)
+		case "rsyncdeleteexcluded":
+			s.RSyncDeleteExcluded = asBool(v)
 		case "maxprocesses":
 			s.MaxProcesses = int(asInt64(v))
 		case "workers":
@@ -447,6 +538,28 @@ func applySync(t tomlTable) (Sync, error) {
 			s.Verify = asBool(v)
 		case "verifyretries", "verify_retries":
 			s.VerifyRetries = int(asInt64(v))
+		case "preserveowner":
+			s.PreserveOwner = strings.ToLower(asString(v))
+		case "preservemode":
+			s.PreserveMode = strings.ToLower(asString(v))
+		case "symlinkmode":
+			s.SymlinkMode = strings.ToLower(asString(v))
+		case "delaymode":
+			s.DelayMode = strings.ToLower(asString(v))
+		case "excludefrom":
+			s.ExcludeFrom = asStrings(v)
+		case "fullresync":
+			s.FullResync = seconds(v)
+		case "preservexattrs":
+			s.PreserveXattrs = asBool(v)
+		case "preservehardlinks":
+			s.PreserveHardlinks = asBool(v)
+		case "sparse":
+			s.Sparse = asBool(v)
+		case "copyspecial":
+			s.CopySpecial = asBool(v)
+		case "bandwidthlimit":
+			s.BandwidthLimit = asBytes(v)
 		case "ssh":
 			st, ok := v.(tomlTable)
 			if !ok {
@@ -459,6 +572,19 @@ func applySync(t tomlTable) (Sync, error) {
 			return s, fmt.Errorf("unknown key %q", k)
 		}
 	}
+	// rsyncssh is serial by default. The original lsyncd pinned it to one
+	// process for a reason: concurrent ssh moves and rsync uploads against the
+	// same destination can observe each other half-applied, and a failed move
+	// falls back to a retransfer of a tree another invocation is already
+	// writing. Users can raise it explicitly, but the safe value has to be the
+	// default.
+	if s.Mode == ModeRsyncSSH && s.MaxProcesses == 0 {
+		s.MaxProcesses = 1
+	}
+	if s.Mode == ModeRsync && !s.remoteSet && IsRemoteTarget(s.Target) {
+		s.Remote = true
+	}
+
 	if s.Name == "" {
 		s.Name = filepath.Base(strings.TrimSuffix(s.Source, "/"))
 		if s.Name == "" || s.Name == "." || s.Name == "/" {
@@ -522,13 +648,26 @@ func (s *Sync) Validate(base string) error {
 			return errors.New("target is required")
 		}
 	}
+	if s.Mode == ModeDirect && s.Remote {
+		return errors.New("remote is only valid with mode = rsync or rsyncssh")
+	}
 	// A direct target inside the source is not a mistake the daemon can
 	// recover from: every file it copies becomes a new source file, which
 	// generates an event, which copies it again, until the disk is full. The
 	// original lsyncd had the same hazard with a local rsync target and no
 	// check at all, so the failure mode was a filled volume rather than an
 	// error message.
-	if s.Mode != ModeRsyncSSH {
+	//
+	// A remote rsync target is opaque: "host:/path" must never be joined to
+	// the configuration directory, or the daemon would rsync into a local
+	// path named after the host. The inference is made here once so main and
+	// the backend see the same answer.
+	remote := s.Mode == ModeRsyncSSH ||
+		(s.Mode == ModeRsync && (s.Remote || (!s.remoteSet && IsRemoteTarget(s.Target))))
+	if s.Mode == ModeRsync && remote {
+		s.Remote = true
+	}
+	if s.Mode != ModeRsyncSSH && !remote {
 		// Relative to the configuration file, like the source above. Resolving
 		// it against the working directory instead would put the target
 		// somewhere under / when started by systemd, and the two paths of one
@@ -548,6 +687,59 @@ func (s *Sync) Validate(base string) error {
 			}
 		}
 	}
+	switch s.PreserveOwner {
+	case "", "auto", "true", "false":
+	default:
+		return fmt.Errorf("preserve_owner: expected auto, true or false, got %q", s.PreserveOwner)
+	}
+	switch s.PreserveMode {
+	case "", "full", "basic":
+	default:
+		return fmt.Errorf("preserve_mode: expected full or basic, got %q", s.PreserveMode)
+	}
+	switch s.SymlinkMode {
+	case "", "safe", "all", "skip":
+	default:
+		return fmt.Errorf("symlink_mode: expected safe, all or skip, got %q", s.SymlinkMode)
+	}
+	switch s.DelayMode {
+	case "", "quiet", "deadline":
+	default:
+		return fmt.Errorf("delay_mode: expected quiet or deadline, got %q", s.DelayMode)
+	}
+	if s.FullResync < 0 {
+		return errors.New("full_resync must not be negative")
+	}
+	if len(s.ExcludeFrom) > 0 {
+		// File patterns come first, inline patterns after them, so an inline
+		// "!rule" has the last word - the same precedence rsync gives the last
+		// matching filter.
+		var fromFile []string
+		for _, name := range s.ExcludeFrom {
+			if name == "" {
+				continue
+			}
+			p := name
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(base, p)
+			}
+			data, err := os.ReadFile(p)
+			if err != nil {
+				return fmt.Errorf("exclude_from %s: %w", name, err)
+			}
+			for _, line := range strings.Split(string(data), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" || strings.HasPrefix(line, "#") {
+					continue
+				}
+				fromFile = append(fromFile, line)
+			}
+		}
+		// Clearing the list makes a second Validate idempotent instead of
+		// appending the same patterns again.
+		s.ExcludeFrom = nil
+		s.Excludes = append(fromFile, s.Excludes...)
+	}
 	if s.Delay < 0 {
 		return errors.New("delay must not be negative")
 	}
@@ -562,6 +754,37 @@ func (s *Sync) Validate(base string) error {
 		s.BatchLimit = 10_000
 	}
 	return nil
+}
+
+// IsRemoteTarget reports whether target names a remote rsync destination.
+//
+// The rules are rsync's own: "host:path", "host::module" and "rsync://" are
+// remote, a plain path is local. The one exception is a Windows drive letter:
+// "C:\dir" contains a colon but is a local path, and treating it as remote
+// would route every deletion through rsync against a host called "C".
+func IsRemoteTarget(target string) bool {
+	if strings.Contains(target, "://") {
+		return true
+	}
+	i := strings.IndexByte(target, ':')
+	if i <= 0 {
+		return false
+	}
+	// rsync only treats a colon before the first path separator as a host
+	// separator. "/mnt/data:snap" and "./host:path" are local paths, and
+	// classifying them remote would skip path resolution and the target
+	// guard for a perfectly ordinary directory.
+	if s := strings.IndexAny(target, `/\`); s >= 0 && s < i {
+		return false
+	}
+	// A Windows drive letter contains a colon but is local.
+	if i == 1 && len(target) > 2 && (target[2] == '\\' || target[2] == '/') {
+		c := target[0]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			return false
+		}
+	}
+	return true
 }
 
 // within reports whether p is at or below root.

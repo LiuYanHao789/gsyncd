@@ -2,7 +2,7 @@
 # Cross-compile every release target into dist/, then write dist/SHA256SUMS.
 #
 #   bash scripts/dist.sh                  # version from the Makefile default
-#   VERSION=0.2.0 bash scripts/dist.sh   # stamp a specific version
+#   VERSION=0.4.0 bash scripts/dist.sh   # stamp a specific version
 #
 # All targets are static (CGO_ENABLED=0), so the output runs on any kernel of
 # the matching arch without a libc, a Lua interpreter or a Go toolchain.
@@ -23,7 +23,7 @@ command -v go > /dev/null 2>&1 || { echo "go not found; install Go 1.23+ or put 
 
 # Keep in step with $(VERSION) in the Makefile: a dist built without an
 # explicit VERSION must not advertise a release that is two versions old.
-VERSION=${VERSION:-0.2.0}
+VERSION=${VERSION:-0.4.0}
 LDFLAGS="-s -w -X main.version=$VERSION"
 mkdir -p "$OUT"
 

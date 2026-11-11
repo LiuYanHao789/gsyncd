@@ -20,6 +20,9 @@ ExecStart=/usr/local/bin/gsyncd -config /etc/gsyncd/gsyncd.toml -nodaemon
 # 首次部署还必须先挂载目标并执行一次 -init-target，否则 target_guard 会让
 # -check 直接失败（这是有意的：避免目标未挂载时写进本地根分区）。
 ExecStartPre=/usr/local/bin/gsyncd -config /etc/gsyncd/gsyncd.toml -check
+# SIGHUP 会先排空在途批次和聚合窗口，再以同一 pid 重新执行自身。
+# systemctl reload gsyncd 等价于 kill -HUP。
+ExecReload=/bin/kill -HUP $MAINPID
 
 # 收到 SIGTERM 后 gsyncd 会停止接收新事件、把在飞的批次做完（内部最多等 30s）。
 # TimeoutStopSec 必须大于这个值，否则正在写的大文件会被 systemd 直接 SIGKILL，

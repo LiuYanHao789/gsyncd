@@ -58,6 +58,9 @@ type SyncState struct {
 	// CloseWrite echoes the per-sync option, so a status file read on its own
 	// says whether Open is merely informational or actually gating flushes.
 	CloseWrite bool `json:"close_write,omitempty"`
+	// FullResync is the effective periodic resync interval for this sync,
+	// empty when disabled. It is per sync because the override is.
+	FullResync string `json:"full_resync,omitempty"`
 }
 
 // Document is the whole status file.
