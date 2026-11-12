@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build unix
 
 package main
 
@@ -65,6 +65,9 @@ func daemonize(logFile string) (bool, error) {
 	go func() { errc <- cmd.Wait() }()
 	select {
 	case err := <-errc:
+		if err == nil {
+			return false, fmt.Errorf("background process exited immediately with status 0")
+		}
 		return false, fmt.Errorf("background process exited immediately: %w", err)
 	case <-time.After(startupGrace):
 	}

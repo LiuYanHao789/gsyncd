@@ -18,7 +18,9 @@ func probeMtimeGranularity(dir string) time.Duration {
 	// exactly the evidence the checkpoint uses. Remember the previous value
 	// and put it back afterwards; only the probe's own change is undone.
 	pre, _ := os.Stat(dir)
-	f, err := createTemp(dir, ".gsyncd-mtime-*")
+	// Same prefix as staged copies: verify-tree ignores it if a SIGKILL leaves
+	// the probe behind.
+	f, err := createTemp(dir, tmpPrefix+"mtime-*")
 	if err != nil {
 		return 0
 	}

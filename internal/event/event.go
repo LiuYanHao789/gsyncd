@@ -85,8 +85,9 @@ func (o Op) String() string {
 
 // Event is a single notification from a watcher.
 //
-// Path is always absolute and cleaned. From is only set when Op == Move and
-// carries the previous absolute path.
+// Path is always absolute and cleaned. From carries the previous absolute
+// path for a rename that has one; a move into the watched tree (Op Move|Create)
+// and a plain create have From == "".
 type Event struct {
 	Path string
 	From string
@@ -104,4 +105,8 @@ type Event struct {
 	// everything below it. The engine sets it when a rename is split at a
 	// filter boundary; see the block comment above the Op constants.
 	Subtree bool
+	// Recreate marks a path whose old incarnation was removed while the name
+	// stayed (a directory moved out and recreated inside the move grace
+	// window). The backend must remove the target before applying the Create.
+	Recreate bool
 }

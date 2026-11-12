@@ -43,9 +43,21 @@ func parseTOML(src string) (tomlTable, error) {
 				return nil, fmt.Errorf("line %d: bad table array header", ln+1)
 			}
 			name := strings.TrimSpace(line[2 : len(line)-2])
-			arr, _ := root[name].([]tomlTable)
+			// A dotted array header ([[sync.ssh]]) belongs to its parent table,
+			// not to a top-level key literally named "sync.ssh".
+			parts := strings.Split(name, ".")
+			parent := root
+			if len(parts) > 1 {
+				p, err := resolveTable(root, strings.Join(parts[:len(parts)-1], "."))
+				if err != nil {
+					return nil, fmt.Errorf("line %d: %w", ln+1, err)
+				}
+				parent = p
+			}
+			leaf := strings.Trim(strings.TrimSpace(parts[len(parts)-1]), "\"'")
+			arr, _ := parent[leaf].([]tomlTable)
 			t := tomlTable{}
-			root[name] = append(arr, t)
+			parent[leaf] = append(arr, t)
 			cur = t
 			continue
 		}
@@ -70,6 +82,11 @@ func parseTOML(src string) (tomlTable, error) {
 		val, err := parseValue(strings.TrimSpace(line[eq+1:]))
 		if err != nil {
 			return nil, fmt.Errorf("line %d: %w", ln+1, err)
+		}
+		if _, exists := cur[key]; exists {
+			// TOML forbids duplicate keys. Last-one-wins silently changed
+			// target/log/delete depending on file order.
+			return nil, fmt.Errorf("line %d: duplicate key %q", ln+1, key)
 		}
 		cur[key] = val
 	}
@@ -116,7 +133,9 @@ func bracketDepth(s string) int {
 		c := s[i]
 		switch {
 		case inStr != 0:
-			if c == '\\' {
+			// Only a basic ("...") string has backslash escapes. A literal
+			// ('...') string ends at the next quote even after a backslash.
+			if inStr == '"' && c == '\\' {
 				i++
 			} else if c == inStr {
 				inStr = 0
@@ -138,7 +157,9 @@ func stripComment(s string) string {
 		c := s[i]
 		switch {
 		case inStr != 0:
-			if c == '\\' {
+			// Only a basic ("...") string has backslash escapes. A literal
+			// ('...') string ends at the next quote even after a backslash.
+			if inStr == '"' && c == '\\' {
 				i++
 			} else if c == inStr {
 				inStr = 0
@@ -159,7 +180,9 @@ func indexUnquoted(s string, target byte) int {
 		c := s[i]
 		switch {
 		case inStr != 0:
-			if c == '\\' {
+			// Only a basic ("...") string has backslash escapes. A literal
+			// ('...') string ends at the next quote even after a backslash.
+			if inStr == '"' && c == '\\' {
 				i++
 			} else if c == inStr {
 				inStr = 0
@@ -286,7 +309,9 @@ func splitTop(s string) []string {
 		c := s[i]
 		switch {
 		case inStr != 0:
-			if c == '\\' {
+			// Only a basic ("...") string has backslash escapes. A literal
+			// ('...') string ends at the next quote even after a backslash.
+			if inStr == '"' && c == '\\' {
 				i++
 			} else if c == inStr {
 				inStr = 0

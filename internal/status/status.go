@@ -199,8 +199,29 @@ func (w *Writer) Flush() error {
 		w.setErr(err)
 		return err
 	}
-	tmp := w.path + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o644); err != nil {
+	// CreateTemp uses O_EXCL and a random name: a fixed .tmp was both
+	// predictable (a symlink planted there could redirect a root daemon's
+	// write) and shared by two instances writing the same status path.
+	tmpf, err := os.CreateTemp(filepath.Dir(w.path), ".gsyncd-status-*.tmp")
+	if err != nil {
+		w.setErr(err)
+		return err
+	}
+	tmp := tmpf.Name()
+	if _, err := tmpf.Write(append(data, '\n')); err != nil {
+		_ = tmpf.Close()
+		_ = os.Remove(tmp)
+		w.setErr(err)
+		return err
+	}
+	if err := tmpf.Chmod(0o644); err != nil {
+		_ = tmpf.Close()
+		_ = os.Remove(tmp)
+		w.setErr(err)
+		return err
+	}
+	if err := tmpf.Close(); err != nil {
+		_ = os.Remove(tmp)
 		w.setErr(err)
 		return err
 	}

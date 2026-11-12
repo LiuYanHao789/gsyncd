@@ -54,5 +54,6 @@ func main() {
 	case <-time.After(*hold):
 	}
 	fmt.Println("releasing watches")
-	be.Close()
+	_ = tree.Close()
+	_ = be.Close()
 }

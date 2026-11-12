@@ -28,6 +28,12 @@ import (
 
 const magic = "GSYNCD-SCAN-1\n"
 
+// sealMagic terminates a segment written by a run that reached the end of the
+// walk. A killed run's .tmp has records but no seal, and must never be adopted:
+// its records can describe directories whose files were still queued when the
+// process died.
+const sealMagic = "GSYNCD-SEAL-1\n"
+
 var errShort = errors.New("scanstate: truncated record")
 
 // Record is what one directory looked like when its copy was verified.
@@ -40,8 +46,8 @@ type Record struct {
 	Mtime int64
 	// Count is the number of direct entries the digest covers.
 	Count uint32
-	// Hash is a digest over the direct entries: for a subdirectory just its
-	// name, for a file its name, size and mtime.
+	// Hash is a digest over the direct entries: mode, uid and gid for every
+	// entry, plus name; a regular file also folds size and mtime.
 	//
 	// A subdirectory's own mtime is deliberately excluded. Including it would
 	// make one write in one leaf invalidate every ancestor up to the root, and
@@ -63,6 +69,8 @@ type Store struct {
 	w       *bufio.Writer
 	scratch []byte
 	written uint64
+	begun   bool
+	failed  bool
 
 	// read side
 	r    *os.File
@@ -94,9 +102,11 @@ func (s *Store) Begin() error {
 	defer s.mu.Unlock()
 	s.closeReader()
 	s.have, s.done, s.used = false, false, 0
+	s.failed = false
+	s.begun = false
 	s.openReader()
 
-	f, err := os.Create(s.tmp)
+	f, err := openScanTemp(s.tmp)
 	if err != nil {
 		s.closeWriter()
 		return err
@@ -104,11 +114,40 @@ func (s *Store) Begin() error {
 	s.f = f
 	s.w = bufio.NewWriterSize(f, 1<<16)
 	s.written = 0
+	s.begun = true
 	if _, err := s.w.WriteString(magic + s.fp + "\n"); err != nil {
+		s.failed = true
 		s.closeWriter()
 		return err
 	}
 	return nil
+}
+
+// openScanTemp creates the segment with O_EXCL|O_NOFOLLOW. The name is fixed
+// (it is the crash-recovery marker), so following a planted symlink here let a
+// local user make a root daemon truncate an arbitrary file.
+func openScanTemp(path string) (*os.File, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		f, err := openScanSegment(path)
+		if err == nil {
+			return f, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+		st, lerr := os.Lstat(path)
+		if lerr != nil {
+			continue
+		}
+		// A stale regular segment from a killed run is safe to replace. A
+		// symlink or any other object is not something we wrote.
+		if !st.Mode().IsRegular() {
+			_ = os.Remove(path)
+			continue
+		}
+		_ = os.Remove(path)
+	}
+	return nil, fmt.Errorf("cannot create scan segment %s", path)
 }
 
 // Lookup returns the record for rel if the previous run reached it.
@@ -156,14 +195,17 @@ func (s *Store) Add(rec Record) {
 	var crc [4]byte
 	binary.LittleEndian.PutUint32(crc[:], crc32.ChecksumIEEE(body))
 	if _, err := s.w.Write(lenBuf[:n]); err != nil {
+		s.failed = true
 		s.closeWriter()
 		return
 	}
 	if _, err := s.w.Write(body); err != nil {
+		s.failed = true
 		s.closeWriter()
 		return
 	}
 	if _, err := s.w.Write(crc[:]); err != nil {
+		s.failed = true
 		s.closeWriter()
 		return
 	}
@@ -187,6 +229,7 @@ func (s *Store) Commit() error {
 		return nil
 	}
 	if err := s.w.Flush(); err != nil {
+		s.failed = true
 		s.closeWriter()
 		return err
 	}
@@ -201,16 +244,29 @@ func (s *Store) Finish(complete bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.w != nil {
-		if err := s.w.Flush(); err == nil {
+		if complete && s.begun {
+			if _, err := s.w.WriteString(sealMagic); err != nil {
+				complete = false
+			}
+		}
+		if err := s.w.Flush(); err != nil {
+			complete = false
+			s.failed = true
+		} else {
 			_ = s.f.Sync()
 		}
 		s.closeWriter()
 	}
 	s.closeReader()
-	if !complete {
+	if !complete || !s.begun || s.failed {
+		// Begin failed: there is no new segment in this run. Removing s.path
+		// here would destroy the last good checkpoint and could promote an
+		// unrelated stale .tmp.
+		s.begun = false
 		return
 	}
-	_ = os.Remove(s.path)
+	s.begun = false
+	s.failed = false
 	if err := os.Rename(s.tmp, s.path); err != nil {
 		s.logf("debug", "scan state: cannot promote %s: %v", s.tmp, err)
 	}
@@ -248,13 +304,13 @@ func (s *Store) openReader() {
 		s.r, s.rb = f, br
 		return
 	}
-	// No complete segment. A segment left by a run that was killed is still
-	// usable: records are only written after the directory they describe has
-	// been fully copied, so the tail is short by at most one batch, never wrong.
-	if st, err := os.Stat(s.tmp); err != nil || !st.Mode().IsRegular() {
-		// Nothing there, or something that is not a segment we wrote (a
-		// directory left by a botched deploy, say). Either way there is
-		// nothing to adopt.
+	// No complete segment. Only adopt a .tmp that carries the end-of-walk
+	// seal: a killed run's segment had records written before its files were
+	// copied, and adopting it could make the next pass skip those files.
+	if st, err := os.Lstat(s.tmp); err != nil || !st.Mode().IsRegular() {
+		return
+	}
+	if !hasSeal(s.tmp) {
 		return
 	}
 	_ = os.Remove(s.path)
@@ -267,26 +323,70 @@ func (s *Store) openReader() {
 }
 
 func (s *Store) tryOpen(path string) (*os.File, *bufio.Reader, bool) {
+	if !hasSeal(path) {
+		return nil, nil, false
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, false
 	}
 	br := bufio.NewReaderSize(f, 1<<16)
-	// The header is two lines: the format marker, then the fingerprint of the
-	// configuration the records belong to.
-	line, err := br.ReadString('\n')
-	if err != nil || line != magic {
+	// The header is two short lines: the format marker, then the fingerprint
+	// of the configuration the records belong to. Bound both reads: a damaged
+	// or hostile file with no newline must not allocate the whole file before
+	// the record-size cap applies.
+	line, ok := scanHeaderLine(br)
+	if !ok || line != magic {
 		_ = f.Close()
 		return nil, nil, false
 	}
-	fp, err := br.ReadString('\n')
-	if err != nil || fp != s.fp+"\n" {
+	fp, ok := scanHeaderLine(br)
+	if !ok || fp != s.fp+"\n" {
 		// A different source, target, exclude list or binary: the records
 		// describe a tree this run is not walking.
 		_ = f.Close()
 		return nil, nil, false
 	}
 	return f, br, true
+}
+
+// hasSeal reports whether path ends with the complete-pass marker. Old
+// checkpoints from before the seal existed are ignored (one extra full walk,
+// then a sealed segment is written).
+func hasSeal(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.Size() < int64(len(sealMagic)) {
+		return false
+	}
+	buf := make([]byte, len(sealMagic))
+	if _, err := f.ReadAt(buf, st.Size()-int64(len(sealMagic))); err != nil {
+		return false
+	}
+	return string(buf) == sealMagic
+}
+
+// scanHeaderLine reads one newline-terminated header line with a hard cap.
+func scanHeaderLine(br *bufio.Reader) (string, bool) {
+	const maxHeader = 4096
+	var buf []byte
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			return "", false
+		}
+		buf = append(buf, b)
+		if len(buf) > maxHeader {
+			return "", false
+		}
+		if b == '\n' {
+			return string(buf), true
+		}
+	}
 }
 
 func (s *Store) next() (Record, bool) {

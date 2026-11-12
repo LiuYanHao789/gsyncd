@@ -31,6 +31,9 @@ import (
 // the original lsyncd (it silently truncated large batches) and lets a single
 // batch carry hundreds of thousands of paths.
 type RSync struct {
+	// st is first so its uint64 fields are 8-byte aligned for atomic
+	// operations on 32-bit architectures.
+	st     Stats
 	Source string
 	Target string
 	// TargetDir is only used by rsyncssh, where Target is a bare host.
@@ -53,7 +56,7 @@ type RSync struct {
 	Binary string
 	// BWLimit is the transfer cap in bytes per second; rsync's own unit is
 	// KiB per second.
-	BWLimit int64
+	BWLimit      int64
 	Compress     bool
 	Xattrs       bool
 	ACLs         bool
@@ -103,8 +106,6 @@ type RSync struct {
 	Timeout time.Duration
 	Logf    func(level string, format string, args ...any)
 	OnLine  func(line string)
-
-	st Stats
 }
 
 // SSHOptions configures the ssh transport for rsyncssh mode.
@@ -192,17 +193,22 @@ func (r *RSync) commonArgs() []string {
 		// pointing outside the tree; that is the faithful "all" mode.
 	default:
 		// --safe-links makes rsync ignore symlinks whose target escapes the
-		// copied tree, matching the direct backend's "internal links only"
-		// default.
+		// copied tree. It is stricter than direct mode: rsync also drops every
+		// *absolute* symlink, even one resolving inside the source, because
+		// only the direct backend can rewrite such a link into the mirror.
+		// This is documented in README.md.
 		args = append(args, "--safe-links")
 	}
 	if r.DeleteExcluded {
 		// --delete-excluded overrides --exclude and would remove the target
 		// guard marker, which exists only on the target. A protect rule keeps
 		// it while still excluding it from the transfer.
-		args = append(args, "--filter=P "+TargetMarkerName)
+		// Anchor the protect rule to the target root: an unanchored P rule
+		// protected (and the exclude below ignored) a same-named file in every
+		// source subdirectory.
+		args = append(args, "--filter=P /"+TargetMarkerName)
 	}
-	args = append(args, "--exclude="+TargetMarkerName)
+	args = append(args, "--exclude=/"+TargetMarkerName)
 	if r.Compress {
 		args = append(args, "--compress")
 	}
@@ -291,21 +297,41 @@ func (r *RSync) rshArg() string {
 	if !r.SSH {
 		return ""
 	}
-	rsh := "ssh"
+	sshBin := "ssh"
 	if r.SSHOpts.Binary != "" {
-		rsh = r.SSHOpts.Binary
+		sshBin = r.SSHOpts.Binary
 	}
+	tokens := []string{sshBin}
 	if r.SSHOpts.Port > 0 {
-		rsh += " -p " + strconv.Itoa(r.SSHOpts.Port)
+		tokens = append(tokens, "-p", strconv.Itoa(r.SSHOpts.Port))
 	}
 	if r.SSHOpts.IdentityFile != "" {
-		rsh += " -i " + r.SSHOpts.IdentityFile
+		tokens = append(tokens, "-i", r.SSHOpts.IdentityFile)
 	}
-	rsh += " -o BatchMode=yes"
-	for _, o := range r.SSHOpts.Extra {
-		rsh += " " + o
+	tokens = append(tokens, "-o", "BatchMode=yes")
+	tokens = append(tokens, r.SSHOpts.Extra...)
+	// rsync itself splits --rsh into tokens. An unquoted identity path or an
+	// option value containing spaces (ProxyCommand="ssh -W %h:%p bastion")
+	// was split into several arguments, while sshRun passes the same values
+	// correctly as single argv entries.
+	for i, tok := range tokens {
+		tokens[i] = rshToken(tok)
 	}
-	return "--rsh=" + rsh
+	return "--rsh=" + strings.Join(tokens, " ")
+}
+
+// rshToken quotes one --rsh word for rsync's own splitter, which is not a
+// shell: inside a single-quoted string a doubled quote represents one quote,
+// and backslash has no escaping power. shellQuote (the shell idiom) corrupts
+// tokens containing a single quote.
+func rshToken(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if !strings.ContainsAny(s, " \t\n\r\"'") {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
 // withoutDeleteFlags strips --delete* from user supplied extra arguments.
@@ -315,10 +341,19 @@ func (r *RSync) rshArg() string {
 // destination".
 func withoutDeleteFlags(args []string) []string {
 	out := make([]string, 0, len(args))
-	for _, a := range args {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		// A user --files-from would replace the NUL stream that carries the
+		// engine's changed paths on incremental runs and remote deletes.
+		if a == "--files-from" {
+			i++
+			continue
+		}
 		// --del is rsync's alias for --delete-during; -d is --dirs and is
 		// unrelated, so it stays.
-		if strings.HasPrefix(a, "--delete") || a == "--del" {
+		if strings.HasPrefix(a, "--delete") || a == "--del" ||
+			strings.HasPrefix(a, "--files-from=") || a == "--from0" ||
+			a == "--remove-source-files" || a == "--remove-sent-files" {
 			continue
 		}
 		out = append(out, a)
@@ -355,8 +390,15 @@ func (r *RSync) Startup(ctx context.Context) error {
 	args := r.baseArgs()
 	// A startup run must mirror the tree, so it does not use --files-from.
 	filtered := make([]string, 0, len(args))
-	for _, a := range args {
-		if strings.HasPrefix(a, "--files-from") || a == "--from0" {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--files-from" {
+			// Skip its separate value too; leaving it behind produced a stray
+			// operand next to the real source/destination.
+			i++
+			continue
+		}
+		if strings.HasPrefix(a, "--files-from=") || a == "--from0" {
 			continue
 		}
 		filtered = append(filtered, a)
@@ -390,7 +432,8 @@ func (r *RSync) removeExtras(ctx context.Context) error {
 	// subject is a directory, so the per-entry Lstat of the whole destination
 	// tree disappears. On a 100 TB mirror that is a hundred million syscalls
 	// saved for a pass that only exists to clean up empty directories.
-	return filepath.WalkDir(r.Target, func(p string, d os.DirEntry, err error) error {
+	var orphans []string
+	err := filepath.WalkDir(r.Target, func(p string, d os.DirEntry, err error) error {
 		if err != nil || p == r.Target {
 			return nil
 		}
@@ -408,22 +451,34 @@ func (r *RSync) removeExtras(ctx context.Context) error {
 			return nil
 		}
 		if _, serr := os.Lstat(filepath.Join(r.Source, rel)); serr != nil {
-			// A directory that still holds files is either a race with rsync
-			// or something we must not touch, and os.Remove reports that as
-			// ENOTEMPTY. Returning the error here would abort the whole walk
-			// on the first non-empty leftover, so the remaining orphans on a
-			// 100 TB mirror would never be visited. Ignore it and continue.
-			_ = os.Remove(p)
+			orphans = append(orphans, p)
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	// WalkDir is pre-order. Removing a directory before its children returns
+	// ENOTEMPTY and never retries, so an orphan chain a/b/c lost everything
+	// above the deepest leaf. Remove deepest first.
+	sort.Slice(orphans, func(i, j int) bool {
+		return len(orphans[i]) > len(orphans[j])
+	})
+	for _, p := range orphans {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		_ = os.Remove(p)
+	}
+	return nil
 }
 
 // uploadSubtree mirrors one whole directory that a filter split turned into a
-// Create. Unlike an ordinary batch it does not use --files-from: the point is
-// to walk the directory recursively, and --delete (when deletion is enabled)
-// makes the destination match the moved subtree instead of keeping entries the
-// source no longer has.
+// Create. It removes the destination first and uploads the directory through
+// the normal --files-from path (rsync -r recurses into a listed directory), so
+// the moved subtree replaces whatever was at the destination.
 func (r *RSync) uploadSubtree(ctx context.Context, c aggregate.Change) error {
 	rel, ok := relInSource(r.Source, c.Path)
 	if !ok {
@@ -455,9 +510,16 @@ func (r *RSync) uploadSubtree(ctx context.Context, c aggregate.Change) error {
 }
 
 // removeDest deletes one destination path, local or remote.
+func isMarkerRel(rel string) bool {
+	return filepath.ToSlash(rel) == TargetMarkerName
+}
+
 func (r *RSync) removeDest(ctx context.Context, abs string) error {
 	rel, ok := relInSource(r.Source, abs)
 	if !ok {
+		return nil
+	}
+	if isMarkerRel(rel) {
 		return nil
 	}
 	if r.remote() {
@@ -543,6 +605,10 @@ func (r *RSync) sshMoveChanges(ctx context.Context, changes []aggregate.Change) 
 			// invocation can take responsibility for.
 			return false
 		}
+		if isMarkerRel(fromRel) || isMarkerRel(toRel) {
+			// Never move the target guard marker.
+			return false
+		}
 		ops = append(ops, moveOp{
 			src: r.sshPath(filepath.ToSlash(fromRel)),
 			dst: r.sshPath(filepath.ToSlash(toRel)),
@@ -560,6 +626,19 @@ func (r *RSync) sshMoveChanges(ctx context.Context, changes []aggregate.Change) 
 	for _, op := range ops {
 		srcSet[op.src] = true
 		dstSet[op.dst] = true
+	}
+	// Two sources where one nests inside the other are applied ancestor-first
+	// below, after which the child's source no longer exists. mv would fail and
+	// set -e would abort the whole batch, so fall back to the normal upload.
+	srcs := make([]string, 0, len(srcSet))
+	for s := range srcSet {
+		srcs = append(srcs, s)
+	}
+	for _, s := range srcs {
+		if hasStrictAncestor(srcSet, s) {
+			r.Logf("debug", "%s: nested rename sources, falling back to rsync", r.Name())
+			return false
+		}
 	}
 	for _, op := range ops {
 		if srcSet[op.dst] || hasStrictAncestor(srcSet, op.dst) ||
@@ -646,6 +725,11 @@ func (r *RSync) sshDeleteChanges(ctx context.Context, changes []aggregate.Change
 				// must not be reported as handled by a skipped invocation.
 				return false
 			}
+			if isMarkerRel(rel) {
+				// The marker exists only on the target; a source-side delete
+				// of a same-named file must not remove it.
+				continue
+			}
 			b.WriteString("rm -rf -- ")
 			b.WriteString(shellQuote(r.sshPath(filepath.ToSlash(rel))))
 			b.WriteByte('\n')
@@ -691,7 +775,7 @@ func (r *RSync) Apply(ctx context.Context, b Batch) error {
 				continue
 			}
 			rel, ok := relInSource(r.Source, c.Path)
-			if !ok {
+			if !ok || isMarkerRel(rel) {
 				continue
 			}
 			if r.remote() {
@@ -951,6 +1035,13 @@ func (r *RSync) upload(ctx context.Context, rels []string) error {
 //     listed directory is removed together with its contents, which is what a
 //     local target's RemoveAll does.
 func (r *RSync) remoteDelete(ctx context.Context, rels []string) error {
+	filtered := rels[:0]
+	for _, rel := range rels {
+		if !isMarkerRel(rel) {
+			filtered = append(filtered, rel)
+		}
+	}
+	rels = filtered
 	if len(rels) == 0 {
 		return nil
 	}
@@ -989,7 +1080,7 @@ func (r *RSync) deleteList(ctx context.Context, abs []string) error {
 		rels := make([]string, 0, len(abs))
 		for _, p := range abs {
 			rel, ok := relInSource(r.Source, p)
-			if !ok {
+			if !ok || isMarkerRel(rel) {
 				continue
 			}
 			rels = append(rels, filepath.ToSlash(rel))
@@ -999,7 +1090,7 @@ func (r *RSync) deleteList(ctx context.Context, abs []string) error {
 	var firstErr error
 	for _, p := range abs {
 		rel, ok := relInSource(r.Source, p)
-		if !ok {
+		if !ok || isMarkerRel(rel) {
 			continue
 		}
 		dst := filepath.Join(r.Target, rel)

@@ -232,3 +232,267 @@ func BenchmarkAdd(b *testing.B) {
 		a.Add(ev(paths[i%len(paths)], event.Write, false))
 	}
 }
+
+func moveEv(from, path string, isDir bool) event.Event {
+	return event.Event{Path: path, From: from, Op: event.Move, IsDir: isDir, At: time.Unix(0, 0)}
+}
+
+func findChange(items []Change, path string) *Change {
+	for i := range items {
+		if items[i].Path == path {
+			return &items[i]
+		}
+	}
+	return nil
+}
+
+func TestRenameChainKeepsRootSource(t *testing.T) {
+	a := New(Options{})
+	a.Add(moveEv("/r/a", "/r/b", false))
+	a.Add(moveEv("/r/b", "/r/c", false))
+	items, _ := a.Flush()
+	c := findChange(items, "/r/c")
+	if c == nil || c.From != "/r/a" {
+		t.Fatalf("rename chain must fold to From=/r/a, got %+v", items)
+	}
+	if len(c.PrevFrom) != 1 || c.PrevFrom[0] != "/r/b" {
+		t.Fatalf("intermediate /r/b must be deleted, got %+v", c.PrevFrom)
+	}
+	if findChange(items, "/r/a") != nil || findChange(items, "/r/b") != nil {
+		t.Fatalf("chain sources must not remain as entries: %+v", items)
+	}
+}
+
+func TestRenameOfEntryAndNodeRetargetsDescendants(t *testing.T) {
+	a := New(Options{})
+	a.Add(ev("/r/D/sub", event.Create, true))
+	a.Add(ev("/r/D/sub/f", event.Write, false))
+	a.Add(moveEv("/r/D", "/r/E", true))
+	items, _ := a.Flush()
+	if findChange(items, "/r/E/sub/f") == nil {
+		t.Fatalf("pending write under an entry+node directory was not retargeted: %+v", items)
+	}
+}
+
+func TestReaddDoesNotLetStaleDeleteCollapseNewerCreate(t *testing.T) {
+	a := New(Options{})
+	a.Add(ev("/r/f", event.Delete, false))
+	items, _ := a.Flush()
+	if len(items) != 1 {
+		t.Fatalf("setup: %+v", items)
+	}
+	stale := items[0]
+	a.Add(ev("/r/f", event.Create|event.Write, false))
+	a.Readd(stale)
+	items, _ = a.Flush()
+	f := findChange(items, "/r/f")
+	if f == nil {
+		t.Fatal("newer create was collapsed by the stale failed delete")
+	}
+	if f.Op&event.Delete != 0 || f.Op&event.Create == 0 {
+		t.Fatalf("newer state must win, got %v", f.Op)
+	}
+}
+
+func TestFollowRenameRetargetsPrevFrom(t *testing.T) {
+	a := New(Options{})
+	a.Add(moveEv("/r/d/x", "/r/d/y", false))
+	a.Add(moveEv("/r/d/z", "/r/d/y", false))
+	a.Add(moveEv("/r/d", "/r/e", true))
+	items, _ := a.Flush()
+	y := findChange(items, "/r/e/y")
+	if y == nil {
+		t.Fatalf("missing retargeted entry: %+v", items)
+	}
+	if len(y.PrevFrom) != 1 || y.PrevFrom[0] != "/r/e/x" {
+		t.Fatalf("PrevFrom must be retargeted into /r/e, got %+v", y.PrevFrom)
+	}
+}
+
+func TestPrevFromIsBounded(t *testing.T) {
+	a := New(Options{})
+	for i := 0; i < maxPrevFrom+100; i++ {
+		a.Add(moveEv("/r/tmp"+itoa(i), "/r/dst", false))
+	}
+	items, overflow := a.Flush()
+	if !overflow {
+		t.Fatal("overflow must be signalled once PrevFrom hits its cap")
+	}
+	dst := findChange(items, "/r/dst")
+	if dst == nil {
+		t.Fatalf("missing dst: %+v", items)
+	}
+	if len(dst.PrevFrom) > maxPrevFrom {
+		t.Fatalf("PrevFrom grew to %d, cap %d", len(dst.PrevFrom), maxPrevFrom)
+	}
+}
+
+func itoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	var b [20]byte
+	p := len(b)
+	for i > 0 {
+		p--
+		b[p] = byte('0' + i%10)
+		i /= 10
+	}
+	return string(b[p:])
+}
+
+func TestRenameRoundTripCollapsesWithoutFrom(t *testing.T) {
+	a := New(Options{})
+	a.Add(moveEv("/r/a", "/r/b", false))
+	a.Add(moveEv("/r/b", "/r/a", false))
+	items, _ := a.Flush()
+	x := findChange(items, "/r/a")
+	if x == nil {
+		t.Fatalf("round trip lost the path: %+v", items)
+	}
+	if x.From == x.Path || x.From != "" {
+		t.Fatalf("From must not point at the path itself: %+v", x)
+	}
+	if len(x.PrevFrom) != 1 || x.PrevFrom[0] != "/r/b" {
+		t.Fatalf("intermediate /r/b must be cleaned up: %+v", x.PrevFrom)
+	}
+}
+
+func TestReaddKeepsDirectoryRenameSource(t *testing.T) {
+	a := New(Options{})
+	a.Add(moveEv("/r/a", "/r/b", true))
+	items, _ := a.Flush()
+	if len(items) != 1 {
+		t.Fatalf("setup: %+v", items)
+	}
+	stale := items[0]
+	// Newer event on the destination; the failed batch never ran, so the
+	// target still has /r/a.
+	a.Add(ev("/r/b", event.Attrib, true))
+	a.Readd(stale)
+	items, _ = a.Flush()
+	b := findChange(items, "/r/b")
+	if b == nil || b.From != "/r/a" {
+		t.Fatalf("Readd dropped the rename source: %+v", items)
+	}
+}
+
+func TestReaddStaleDirDeleteImpliesRecreate(t *testing.T) {
+	a := New(Options{})
+	a.Add(ev("/r/d", event.Delete, true))
+	items, _ := a.Flush()
+	stale := items[0]
+	a.Add(ev("/r/d", event.Create, true))
+	a.Readd(stale)
+	items, _ = a.Flush()
+	d := findChange(items, "/r/d")
+	if d == nil || !d.Recreate {
+		t.Fatalf("stale directory delete must set Recreate: %+v", items)
+	}
+}
+
+func TestRecreateSignalSurvivesNewerCreate(t *testing.T) {
+	a := New(Options{})
+	a.Add(ev("/r/d", event.Create, true))
+	a.Add(event.Event{Path: "/r/d", Op: event.Delete | event.Create, IsDir: true, Recreate: true, Subtree: true})
+	items, _ := a.Flush()
+	d := findChange(items, "/r/d")
+	if d == nil || !d.Recreate || !d.Subtree || d.Op&event.Create == 0 {
+		t.Fatalf("recreate signal was lost: %+v", items)
+	}
+}
+
+func TestReaddFoldsProducerIntoNewerConsumer(t *testing.T) {
+	a := New(Options{})
+	// Newer window: c <- f (f already renamed to c at the source).
+	a.Add(moveEv("/r/f", "/r/c", false))
+	// Failed older batch: f <- e is put back.
+	a.Readd(Change{Path: "/r/f", From: "/r/e", Op: event.Move, Kind: KindFile, At: time.Unix(1, 0)})
+	items, _ := a.Flush()
+	if findChange(items, "/r/f") != nil {
+		t.Fatalf("transient rename target must be folded away: %+v", items)
+	}
+	c := findChange(items, "/r/c")
+	if c == nil || c.From != "/r/e" {
+		t.Fatalf("consumer must be folded to the chain root: %+v", items)
+	}
+}
+
+func TestReaddFoldKeepsContentBits(t *testing.T) {
+	a := New(Options{})
+	a.Add(moveEv("/r/f", "/r/g", false))
+	stale := Change{Path: "/r/f", From: "/r/e", Op: event.Move | event.Write, Kind: KindFile, At: time.Unix(1, 0)}
+	a.Readd(stale)
+	items, _ := a.Flush()
+	g := findChange(items, "/r/g")
+	if g == nil || g.From != "/r/e" {
+		t.Fatalf("fold wrong: %+v", items)
+	}
+	if g.Op&event.Write == 0 {
+		t.Fatalf("failed batch content bit was dropped: %+v", g)
+	}
+}
+
+func TestReaddContentChangeConsumedByRename(t *testing.T) {
+	a := New(Options{})
+	a.Add(moveEv("/r/p", "/r/q", false))
+	a.Readd(Change{Path: "/r/p", Op: event.Write, Kind: KindFile, At: time.Unix(1, 0)})
+	items, _ := a.Flush()
+	if findChange(items, "/r/p") != nil {
+		t.Fatalf("stale content path should be folded away: %+v", items)
+	}
+	q := findChange(items, "/r/q")
+	if q == nil || q.From != "/r/p" || q.Op&event.Write == 0 {
+		t.Fatalf("consumer must copy from source with stale write bits: %+v", items)
+	}
+}
+
+func TestReaddKeepOpenMergesContentBits(t *testing.T) {
+	a := New(Options{})
+	// Newer metadata change, failed batch carried the content write.
+	a.Add(ev("/r/p", event.Attrib, false))
+	items, _ := a.Flush()
+	stale := Change{Path: "/r/p", Op: event.Write, Kind: KindFile, At: time.Unix(1, 0)}
+	a.Readd(stale)
+	items, _ = a.Flush()
+	p := findChange(items, "/r/p")
+	if p == nil || p.Op&event.Write == 0 {
+		t.Fatalf("content bit from failed batch lost: %+v", items)
+	}
+}
+
+func TestReaddBatchDoesNotFoldSameBatchChanges(t *testing.T) {
+	a := New(Options{})
+	// One failed batch: mv b a (a<-b), then b recreated and written.
+	changes := []Change{
+		{Path: "/r/a", From: "/r/b", Op: event.Move, Kind: KindFile, At: time.Unix(1, 0)},
+		{Path: "/r/b", Op: event.Create | event.Write, Kind: KindFile, At: time.Unix(2, 0)},
+	}
+	a.ReaddBatch(changes)
+	items, _ := a.Flush()
+	if findChange(items, "/r/a") == nil || findChange(items, "/r/b") == nil {
+		t.Fatalf("same-batch changes must both survive: %+v", items)
+	}
+}
+
+func TestRemoveAtPreservesFirstConsumer(t *testing.T) {
+	a := New(Options{})
+	a.Add(moveEv("/r/x", "/r/a", false)) // first consumer of /r/x
+	a.Add(ev("/r/w", event.Create, false))
+	a.Add(moveEv("/r/x", "/r/b", false)) // later incarnation
+	// Collapse w: removeAt swaps the tail (/r/b) into its slot.
+	a.Add(ev("/r/w", event.Delete, false))
+	a.Readd(Change{Path: "/r/x", Op: event.Delete, Kind: KindFile, At: time.Unix(1, 0)})
+	items, _ := a.Flush()
+	b := findChange(items, "/r/b")
+	aa := findChange(items, "/r/a")
+	if b == nil || aa == nil {
+		t.Fatalf("missing entries: %+v", items)
+	}
+	if b.FromCycle {
+		t.Fatalf("stale delete was attached to the later incarnation: %+v", items)
+	}
+	if !aa.FromCycle {
+		t.Fatalf("first consumer must be protected: %+v", items)
+	}
+}

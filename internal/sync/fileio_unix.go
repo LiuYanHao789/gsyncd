@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -24,18 +23,22 @@ import (
 // registration is attempted. The measurement on a small sync drops from ~8
 // fcntl + 2 epoll_ctl per file to ~1 fcntl and no epoll_ctl.
 
-var tmpSeq uint64
-
 // isNoSpace reports whether a copy failure means the target filesystem is
 // full. Consecutive failures of this kind stop the pass: hammering a full disk
 // with millions of doomed small files can run for hours on a large tree.
-func isNoSpace(err error) bool { return errors.Is(err, syscall.ENOSPC) }
+func isNoSpace(err error) bool {
+	return errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT)
+}
 
 func openRead(path string) (*os.File, error) {
 	var fd int
 	var err error
 	for {
-		fd, err = syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC, 0)
+		// O_NOFOLLOW: the caller already decided this is a regular file from
+		// Lstat. If the path was swapped for a symlink between then and now,
+		// following it would copy the referent (e.g. /etc/shadow) into the
+		// mirror under the regular file's name.
+		fd, err = syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 		if err != syscall.EINTR {
 			break
 		}
@@ -56,7 +59,7 @@ func createTemp(dir, pattern string) (*os.File, error) {
 	base := fmt.Sprintf("%s%d-%d", prefix, os.Getpid(), time.Now().UnixNano())
 	var last error
 	for i := 0; i < 10000; i++ {
-		name := filepath.Join(dir, fmt.Sprintf("%s-%d", base, atomic.AddUint64(&tmpSeq, 1)))
+		name := filepath.Join(dir, fmt.Sprintf("%s-%d", base, nextTmpSeq()))
 		fd, err := syscall.Open(name, syscall.O_RDWR|syscall.O_CREAT|syscall.O_EXCL|syscall.O_CLOEXEC, 0o600)
 		if err == nil {
 			f := os.NewFile(uintptr(fd), name)

@@ -4,7 +4,7 @@
 
 ```
 $ gsyncd -version
-gsyncd 0.5.1 (1.23.5)
+gsyncd 0.5.2 (1.23.5)
 ```
 
 ## 特性
@@ -116,7 +116,7 @@ gsyncd -status /var/lib/gsyncd/status.json
 | `delete` | `true` | `true`/`false`/`"startup"`/`"running"` |
 | `excludes` | `[]` | rsync 风格排除模式 |
 | `exclude_from` | `[]` | 排除规则文件（相对配置文件目录），文件规则在前、内联规则在后 |
-| `symlink_mode` | `"safe"` | `"safe"` 仅根内链接；`"all"` 原样复制；`"skip"`；三种后端都支持 |
+| `symlink_mode` | `"safe"` | `"safe"` 仅根内链接；`"all"` 原样复制；`"skip"`；三种后端都支持。注意 `mode="rsync"` 的 safe 使用 `--safe-links`，会丢弃所有绝对链接（包括解析在源根内的），比 direct 更严格 |
 | `bandwidth_limit` | `0` | direct 复制限速（字节/秒）；rsync/rsyncssh 在未设置 `rsync_bwlimit` 时作为回退 |
 | `full_resync` | `0` | 本 sync 的周期全量；0 继承全局 |
 | `max_processes` | 0（用全局） | 该 sync 的并发上限 |
@@ -143,10 +143,20 @@ gsyncd -status /var/lib/gsyncd/status.json
 | `copy_special` | `false` | Linux FIFO/设备节点（设备节点需要 root） |
 | `workers` | `min(CPU,16)` | 并行拷贝 goroutine 数 |
 | `prefetch` | `min(CPU,16)` | 初始遍历预读目录的 goroutine 数 |
-| `checkpoint` | `""` | 断点续扫记录文件；`"auto"` 自动选目录 |
+| `checkpoint` | `""` | 断点续扫记录文件；`"auto"` 自动选目录。只加速重启，不替代校验：目标端原地篡改（不改变父目录 mtime）不会被发现，需要时定期跑 `-verify-content` |
 | `fsync` | `false` | 每个文件 rename 前 fsync |
 | `verify` | `true` | 传输时 SHA-256 校验 |
 | `verify_retries` | `2` | 校验失败后的额外重拷次数 |
+
+#### 配置解析约束（0.5.x）
+
+- `source` 必须本身是真实目录；根路径是 symlink 时直接拒绝，请写解析后的路径（避免 safe 模式被绕过、目标根被清空）。
+- 同一表内重复键、以及 `exclude`/`excludes`、`rsync_opts`/`rsync_extra` 这类别名同时出现，会报错，不再由 map 顺序决定谁生效。
+- `[[global]]` 是错误写法，必须是单个 `[global]`。
+- 时长/大小字符串必须能被完整解析：`"1d"`、`"2 minutes"`、`"100MB"` 会报错（`1d` 曾静默变成 1 秒）。
+- `delete = "true"`/`"yes"` 与布尔 `true` 语义一致（启动 prune + 运行期删除）。
+- `rsyncssh` 的 `target` 只能是 host/`user@host`；`target_dir` 不接受 `~`。
+- `checkpoint` 记录在整轮遍历结束时统一落盘；超宽平铺目录（数万同级目录）受内存上限影响会只保留部分记录，未保留的目录下次重新核对（只影响重启速度，不影响正确性）。未完整走完的段带不上 seal，下次不会采用。
 
 #### `rsync` / `rsyncssh` 专用参数
 
@@ -201,7 +211,7 @@ gsyncd -status /var/lib/gsyncd/status.json
 
 ## 目标守卫
 
-`target_guard = true`（默认）时，启动前要求目标已存在，且位于非 `/` 挂载点或包含 `.gsyncd-target` marker。首次挂载后执行一次：
+`target_guard = true`（默认）时，启动前要求目标已存在，且解析 symlink 后与根文件系统**不是同一设备**，或包含 `.gsyncd-target` marker。首次挂载后执行一次：
 
 ```bash
 gsyncd -config /etc/gsyncd/gsyncd.toml -init-target

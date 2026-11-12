@@ -29,8 +29,8 @@ type Change struct {
 	// example two renames onto one destination inside one window). Every one
 	// of them has to disappear from the target as well.
 	PrevFrom []string
-	Op   event.Op
-	Kind Kind
+	Op       event.Op
+	Kind     Kind
 	// At is the first time this path was touched in the window.
 	At time.Time
 	// Recreate marks a directory that was deleted and created again inside the
@@ -39,6 +39,14 @@ type Change struct {
 	// survive in the mirror, because a recreated directory carries no implied
 	// removal of its old contents.
 	Recreate bool
+	// FromCycle marks a rename that is part of a dependency cycle (the common
+	// mv a tmp; mv b a; mv tmp b swap). The backend must copy from the source
+	// instead of renaming target copies, and must not remove a source that is
+	// another cycle member's destination.
+	FromCycle bool
+	// KeepSource suppresses the post-rename removal of From. It is set for
+	// cycle members whose source name is also a destination in the batch.
+	KeepSource bool
 
 	// Subtree marks a directory Create that must copy the whole source
 	// subtree. It is set by the engine when a rename crosses a filter
@@ -105,15 +113,29 @@ type dirNode struct {
 	// paths that live in Aggregator.index, and subdirectory paths that live in
 	// Aggregator.nodes.
 	children []string
+	// childSet mirrors children for O(1) membership. A path can be both an
+	// entry and a node (a directory with a pending change and pending
+	// children); keeping one link for it, removed only when neither remains,
+	// prevents the duplicate links that used to corrupt slots.
+	childSet map[string]int
 	parent   string
 	slot     int
 }
 
+// maxPrevFrom bounds the stale names folded into one change. Past this point
+// the window is marked overflowed: the names are recovered by the full resync,
+// which is cheaper than letting a hot atomic-replace path grow without limit.
+const maxPrevFrom = 512
+
 // Aggregator collapses events. It is safe for concurrent use.
 type Aggregator struct {
-	mu       sync.Mutex
-	opts     Options
-	index    map[string]int
+	mu    sync.Mutex
+	opts  Options
+	index map[string]int
+	// fromIdx maps a rename source to one entry (by item position). Readd
+	// needs to find the newer consumer of a failed change without scanning a
+	// window that can hold millions of entries under the lock.
+	fromIdx  map[string]int
 	nodes    map[string]*dirNode
 	items    []Change
 	pending  int
@@ -161,9 +183,10 @@ func New(opts Options) *Aggregator {
 		opts.Now = time.Now
 	}
 	return &Aggregator{
-		opts:  opts,
-		index: make(map[string]int, 1024),
-		nodes: make(map[string]*dirNode, 256),
+		opts:    opts,
+		index:   make(map[string]int, 1024),
+		fromIdx: make(map[string]int, 128),
+		nodes:   make(map[string]*dirNode, 256),
 	}
 }
 
@@ -181,7 +204,7 @@ func (a *Aggregator) Add(ev event.Event) {
 
 	// A directory delete makes every pending child irrelevant: the backend
 	// removes the subtree in one go.
-	if ev.IsDir && ev.Op&event.Delete != 0 {
+	if ev.IsDir && ev.Op&event.Delete != 0 && ev.Op&event.Create == 0 && !ev.Recreate {
 		a.dropSubtree(ev.Path)
 	}
 
@@ -194,7 +217,8 @@ func (a *Aggregator) Add(ev event.Event) {
 	if ev.IsDir {
 		kind = KindDir
 	}
-	a.upsert(Change{Path: ev.Path, Op: ev.Op, Kind: kind, At: ev.At, Subtree: ev.Subtree})
+	a.upsert(Change{Path: ev.Path, Op: ev.Op, Kind: kind, At: ev.At,
+		Subtree: ev.Subtree, Recreate: ev.Recreate})
 }
 
 // upsert merges a change into the existing entry for the same path.
@@ -211,6 +235,73 @@ func (a *Aggregator) upsert(c Change) { a.upsertKnown(c, false) }
 func (a *Aggregator) Readd(c Change) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.readdLocked(c, a.snapshotFromIdx())
+}
+
+// ReaddBatch re-adds one failed batch in a single critical section. Folding is
+// limited to consumers that existed before the batch: two changes from the
+// same failed batch are not "newer" than each other, even when Readd is called
+// in Path-sorted order ("mv b a" plus a recreated b is the common case).
+func (a *Aggregator) ReaddBatch(changes []Change) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	pre := a.snapshotFromIdx()
+	for _, c := range changes {
+		a.readdLocked(c, pre)
+	}
+}
+
+func (a *Aggregator) snapshotFromIdx() map[string]int {
+	pre := make(map[string]int, len(a.fromIdx))
+	for k, v := range a.fromIdx {
+		pre[k] = v
+	}
+	return pre
+}
+
+func (a *Aggregator) readdLocked(c Change, pre map[string]int) {
+	if c.Path != "" {
+		// A newer change may already consume c's path: source did f<-e, then
+		// c<-f while the failed batch (f<-e) was retrying. Folding the stale
+		// link/content into the consumer gives the right final source; inserting
+		// both leaves a transient path that no longer exists and can be
+		// resurrected by rename ordering.
+		if i, ok := pre[c.Path]; ok && i < len(a.items) {
+			t := &a.items[i]
+			if t.From == c.Path && t.Path != c.Path {
+				if c.Op&event.Move != 0 && c.From != "" && c.From != c.Path {
+					if j, ok := a.fromIdx[t.From]; ok && j == i {
+						delete(a.fromIdx, t.From)
+					}
+					t.From = c.From
+					a.fromIdx[c.From] = i
+					t.PrevFrom = a.addPrevFrom(t.PrevFrom, c.Path)
+				} else if c.Op&event.Delete != 0 && c.Op&(event.Create|event.Write|event.Attrib) == 0 {
+					// Stale delete: the target copy must be replaced from the
+					// live source, not renamed.
+					t.FromCycle = true
+				}
+				t.Op |= c.Op & (event.Create | event.Write | event.Attrib)
+				if c.Kind == KindDir {
+					t.Kind = KindDir
+				}
+				if c.Recreate {
+					t.Recreate = true
+				}
+				if c.Subtree {
+					t.Subtree = true
+				}
+				for _, pf := range c.PrevFrom {
+					t.PrevFrom = a.addPrevFrom(t.PrevFrom, pf)
+				}
+				if c.At.Before(t.At) {
+					t.At = c.At
+				}
+				a.stats.Collapsed++
+				return
+			}
+		}
+	}
 	a.upsertKnown(c, true)
 }
 
@@ -219,6 +310,60 @@ func (a *Aggregator) Readd(c Change) {
 func (a *Aggregator) upsertKnown(c Change, keepOpen bool) {
 	if i, ok := a.index[c.Path]; ok {
 		old := &a.items[i]
+		if keepOpen {
+			// Readd: the entry already in the window describes a newer state
+			// than the failed batch, so its Op must win. Merging the stale
+			// bits used to let an old Delete collapse a newer Create (or OR a
+			// Delete into a newer Move|Write), leaving the path missing until
+			// a restart.
+			//
+			// The rename source still has to be carried: the failed batch may
+			// never have run, in which case the target still holds the old
+			// name. Dropping From left a directory rename as a bare Attrib,
+			// which only does MkdirAll and never copies the subtree.
+			if c.From != "" {
+				if old.Op&event.Delete != 0 && old.Op&(event.Create|event.Write) == 0 {
+					// Newer state is a delete; the old rename source has to
+					// disappear too, but there is nothing to rename. Let the
+					// batch-level PrevFrom cleanup remove it.
+					old.PrevFrom = a.addPrevFrom(old.PrevFrom, c.From)
+				} else if old.From == "" {
+					old.From = c.From
+					a.fromIdx[c.From] = i
+				} else if old.From != c.From && c.From != old.Path {
+					old.PrevFrom = a.addPrevFrom(old.PrevFrom, c.From)
+				}
+			}
+			for _, pf := range c.PrevFrom {
+				old.PrevFrom = a.addPrevFrom(old.PrevFrom, pf)
+			}
+			// The failed batch may contain the only record that content was
+			// changed. Merge it unless the newer state is a pure Delete (which
+			// must not be weakened back into a write).
+			if old.Op&event.Delete == 0 || old.Op&(event.Create|event.Write) != 0 {
+				old.Op |= c.Op & (event.Create | event.Write | event.Attrib)
+				// Deliberately do not adopt c.open: Readd trusts the newer
+				// entry's open state (a close during the retry must stick).
+			}
+			// A stale directory Delete means the target may still contain the
+			// old incarnation's children; only Recreate removes them.
+			if c.Op&event.Delete != 0 &&
+				(c.Kind == KindDir || old.Kind == KindDir) &&
+				old.Op&(event.Create|event.Write|event.Attrib) != 0 {
+				old.Recreate = true
+			}
+			if c.Recreate {
+				old.Recreate = true
+			}
+			if c.Subtree {
+				old.Subtree = true
+			}
+			if c.At.Before(old.At) {
+				old.At = c.At
+			}
+			a.stats.Collapsed++
+			return
+		}
 		merged := old.Op | c.Op
 		// delete then create == a modify of whatever is there now. For a file
 		// that is an atomic replace; for a directory it is not - the target
@@ -234,8 +379,10 @@ func (a *Aggregator) upsertKnown(c Change, keepOpen bool) {
 				old.Recreate = true
 			}
 		}
-		// create then delete == nothing happened.
-		if old.Op&event.Create != 0 && c.Op&event.Delete != 0 && old.From == "" {
+		// create then delete == nothing happened. A Delete that also carries
+		// Create is the "old incarnation removed, name recreated" signal and
+		// must survive to set Recreate.
+		if old.Op&event.Create != 0 && c.Op&event.Delete != 0 && c.Op&event.Create == 0 && old.From == "" {
 			a.removeAt(i)
 			a.stats.Collapsed++
 			return
@@ -254,35 +401,31 @@ func (a *Aggregator) upsertKnown(c Change, keepOpen bool) {
 		if c.Recreate {
 			old.Recreate = true
 		}
+		for _, pf := range c.PrevFrom {
+			old.PrevFrom = a.addPrevFrom(old.PrevFrom, pf)
+		}
 		if c.From != "" {
-			if keepOpen {
-				// This is a failed batch being re-added: it predates anything
-				// already in the window, so it must not clear a newer Delete.
-				// Its old name still has to be cleaned up.
-				if old.From == "" {
-					old.From = c.From
-				} else if old.From != c.From {
-					old.PrevFrom = appendFrom(old.PrevFrom, c.From)
-				}
-			} else {
-				// A newer move landing on this path means it exists in the
-				// final state, so a pending Delete is superseded. Earlier
-				// rename sources have to be deleted too.
-				old.Op &^= event.Delete
-				if old.From != "" && old.From != c.From {
-					old.PrevFrom = appendFrom(old.PrevFrom, old.From)
+			// A newer move landing on this path means it exists in the final
+			// state, so a pending Delete is superseded. Earlier rename
+			// sources have to be deleted too.
+			old.Op &^= event.Delete
+			if old.From != "" && old.From != c.From {
+				old.PrevFrom = a.addPrevFrom(old.PrevFrom, old.From)
+			}
+			if old.From != c.From {
+				if old.From != "" {
+					if j, ok := a.fromIdx[old.From]; ok && j == i {
+						delete(a.fromIdx, old.From)
+					}
 				}
 				old.From = c.From
+				if _, ok := a.fromIdx[c.From]; !ok {
+					a.fromIdx[c.From] = i
+				}
 			}
 		}
 		if c.At.Before(old.At) {
 			old.At = c.At
-		}
-		if keepOpen {
-			// The entry already knows the newest answer: events that arrived
-			// between the failed flush and this retry were folded in as they
-			// happened, so leave its flag alone.
-			return
 		}
 		open := nextOpen(old.open, c)
 		if c.open {
@@ -372,9 +515,7 @@ func (a *Aggregator) appendItem(c Change) {
 	}
 	c.parent = parentOf(c.Path)
 	a.ensureDir(c.parent)
-	node := a.nodes[c.parent]
-	c.slot = len(node.children)
-	node.children = append(node.children, c.Path)
+	c.slot = a.linkChild(c.parent, c.Path)
 
 	// c.open is pre-set only by applyMove (a rename carries the flag: renaming
 	// an open file does not close it) and by Readd (a failed batch keeps the
@@ -389,7 +530,16 @@ func (a *Aggregator) appendItem(c Change) {
 		a.openFiles++
 	}
 	a.items = append(a.items, c)
-	a.index[c.Path] = len(a.items) - 1
+	idx := len(a.items) - 1
+	a.index[c.Path] = idx
+	if c.From != "" {
+		// First consumer wins: a later rename with the same From implies the
+		// name was recreated in between, and a stale Readd belongs to the
+		// first incarnation.
+		if _, ok := a.fromIdx[c.From]; !ok {
+			a.fromIdx[c.From] = idx
+		}
+	}
 	if a.oldest.IsZero() || (!c.At.IsZero() && c.At.Before(a.oldest)) {
 		a.oldest = c.At
 	}
@@ -420,19 +570,40 @@ func (a *Aggregator) ensureDir(dir string) {
 		return
 	}
 	up := parentOf(dir)
-	n := &dirNode{parent: up}
+	n := &dirNode{parent: up, childSet: make(map[string]int)}
 	a.nodes[dir] = n
 	if up == dir {
 		n.parent = ""
 		return
 	}
 	a.ensureDir(up)
-	pn := a.nodes[up]
-	if pn == nil {
+	if a.nodes[up] == nil {
 		return
 	}
-	n.slot = len(pn.children)
-	pn.children = append(pn.children, dir)
+	n.slot = a.linkChild(up, dir)
+}
+
+// linkChild adds child to parent once and returns its slot. An entry and an
+// internal node for the same path share one link; the link is removed only
+// when both are gone (see unlink).
+func (a *Aggregator) linkChild(parent, child string) int {
+	node := a.nodes[parent]
+	if node == nil {
+		return -1
+	}
+	if node.childSet == nil {
+		node.childSet = make(map[string]int, len(node.children))
+		for i, c := range node.children {
+			node.childSet[c] = i
+		}
+	}
+	if slot, ok := node.childSet[child]; ok {
+		return slot
+	}
+	slot := len(node.children)
+	node.children = append(node.children, child)
+	node.childSet[child] = slot
+	return slot
 }
 
 func (a *Aggregator) applyMove(ev event.Event) {
@@ -451,19 +622,37 @@ func (a *Aggregator) applyMove(ev event.Event) {
 	// recreated before being moved must not be applied as a rename of the old
 	// target copy, which still holds the deleted children.
 	var recreate bool
-	if ev.IsDir {
-		// A directory's pending Attrib/Create change has to survive the
-		// rename. followRename removes the old entry, so capture it first.
-		if i, ok := a.index[ev.From]; ok {
-			carried = a.items[i].Op & (event.Attrib | event.Create)
-			recreate = a.items[i].Recreate
+	// from is the root of a rename chain. Windows-style "mv a b; mv b c" used
+	// to become "c From b", which renamed the stale target copy of b to c and
+	// left a behind. Folding the chain back to a gives the backend the path
+	// that actually still exists in the target, and prev collects the
+	// intermediate names that must be deleted.
+	from := ev.From
+	var prev []string
+	if i, ok := a.index[ev.From]; ok {
+		old := &a.items[i]
+		if ev.IsDir {
+			// A directory's pending Attrib/Create change has to survive the
+			// rename. followRename removes the old entry, so capture it first.
+			carried = old.Op & (event.Attrib | event.Create)
+		} else {
+			carried = old.Op & (event.Create | event.Write | event.Attrib)
+			wasOpen = old.open
 		}
+		recreate = old.Recreate
+		if old.From != "" {
+			from = old.From
+			prev = a.addPrevFrom(prev, old.Path)
+		}
+		for _, pf := range old.PrevFrom {
+			prev = a.addPrevFrom(prev, pf)
+		}
+		if !ev.IsDir {
+			a.removeAt(i)
+		}
+	}
+	if ev.IsDir {
 		a.followRename(ev.From, ev.Path)
-	} else if i, ok := a.index[ev.From]; ok {
-		carried = a.items[i].Op & (event.Create | event.Write | event.Attrib)
-		recreate = a.items[i].Recreate
-		wasOpen = a.items[i].open
-		a.removeAt(i)
 	}
 	// Renaming a directory renames everything below it, so the kind has to
 	// survive: a KindFile entry loses the dropSubtree shortcut for every later
@@ -472,11 +661,31 @@ func (a *Aggregator) applyMove(ev event.Event) {
 	if ev.IsDir {
 		kind = KindDir
 	}
+	if from == ev.Path {
+		// "mv a b; mv b a" folds back onto itself. Emitting Move with
+		// From==Path made the backend copy the file and then remove its own
+		// destination (or rename a path onto itself). Emit an ordinary
+		// content/create change; PrevFrom still cleans up the intermediate name.
+		if ev.IsDir {
+			// The target directory may already hold content (the readded
+			// rename may have been partially applied), so build it from the
+			// live source instead of assuming the target copy is intact.
+			a.upsert(Change{Path: ev.Path, Op: event.Create | carried, Kind: KindDir, At: ev.At,
+				Recreate: recreate, Subtree: true, PrevFrom: prev})
+		} else {
+			a.upsert(Change{Path: ev.Path, Op: event.Write | carried, Kind: KindFile, At: ev.At, PrevFrom: prev, open: wasOpen})
+		}
+		return
+	}
 	if ev.Op&event.Create != 0 && ev.From == "" {
 		a.upsert(Change{Path: ev.Path, Op: event.Create | carried, Kind: kind, At: ev.At, open: wasOpen})
 		return
 	}
-	a.upsert(Change{Path: ev.Path, From: ev.From, Op: event.Move | carried, Kind: kind, At: ev.At, Recreate: recreate, open: wasOpen})
+	a.upsert(Change{
+		Path: ev.Path, From: from, PrevFrom: prev,
+		Op: event.Move | carried, Kind: kind, At: ev.At,
+		Recreate: recreate, open: wasOpen,
+	})
 }
 
 // followRename moves pending children of a renamed directory to their new
@@ -507,6 +716,20 @@ func (a *Aggregator) followRename(from, to string) {
 			if c.From != "" && underPath(from, c.From) {
 				c.From = to + c.From[len(from):]
 			}
+			if len(c.PrevFrom) > 0 {
+				// The target directory rename moves the whole old subtree, so
+				// stale names below the old prefix now live below the new one.
+				// Leaving them under the old prefix made removePrevFrom delete
+				// a path that no longer exists and leave the real stale file.
+				var rewritten []string
+				for _, pf := range c.PrevFrom {
+					if underPath(from, pf) {
+						pf = to + pf[len(from):]
+					}
+					rewritten = a.addPrevFrom(rewritten, pf)
+				}
+				c.PrevFrom = rewritten
+			}
 			retarget = append(retarget, c)
 		}
 		// Look the index up again: removeAt swaps the tail into i.
@@ -519,8 +742,20 @@ func (a *Aggregator) followRename(from, to string) {
 	}
 }
 
-// appendFrom adds p once, preserving the order earlier renames were seen.
-func appendFrom(list []string, p string) []string {
+// addPrevFrom adds p once, preserving the order earlier renames were seen.
+// The list is bounded: a hot atomic-replace path can otherwise grow it without
+// limit (the item count stays at one, so MaxPending never fires), and the
+// linear dedupe would become O(n^2) under the aggregator lock. Past the cap
+// the window is marked overflowed so a full resync recovers the names.
+func (a *Aggregator) addPrevFrom(list []string, p string) []string {
+	if p == "" {
+		return list
+	}
+	if len(list) >= maxPrevFrom {
+		a.overflow = true
+		a.urgent = true
+		return list
+	}
 	for _, x := range list {
 		if x == p {
 			return list
@@ -561,18 +796,39 @@ func (a *Aggregator) dropSubtree(root string) {
 }
 
 // subtreePaths collects root and every pending entry below it.
+//
+// A path can be both an entry (it has a pending Create/Attrib) and an internal
+// node (something below it is pending). Returning at the entry used to skip
+// the node's children, so a rename of the parent dropped pending writes below
+// such an intermediate directory. The seen set also absorbs the duplicate
+// child links older windows could contain.
 func (a *Aggregator) subtreePaths(dir string, out []string) []string {
-	out = append(out, dir)
+	return a.subtreePathsInto(dir, out,
+		make(map[string]bool, len(out)+16), // emitted
+		make(map[string]bool, len(out)+16)) // node expanded
+}
+
+func (a *Aggregator) subtreePathsInto(dir string, out []string, seen, expanded map[string]bool) []string {
+	if !seen[dir] {
+		seen[dir] = true
+		out = append(out, dir)
+	}
+	if expanded[dir] {
+		return out
+	}
+	expanded[dir] = true
 	node := a.nodes[dir]
 	if node == nil {
 		return out
 	}
 	for _, child := range node.children {
-		if _, isEntry := a.index[child]; isEntry {
+		if _, isEntry := a.index[child]; isEntry && !seen[child] {
+			seen[child] = true
 			out = append(out, child)
-			continue
 		}
-		out = a.subtreePaths(child, out)
+		if _, isNode := a.nodes[child]; isNode {
+			out = a.subtreePathsInto(child, out, seen, expanded)
+		}
 	}
 	return out
 }
@@ -582,36 +838,74 @@ func (a *Aggregator) removeAt(i int) {
 	if c.open {
 		a.openFiles--
 	}
-	a.unlink(c.parent, c.Path, c.slot)
 
+	if c.From != "" {
+		if j, ok := a.fromIdx[c.From]; ok && j == i {
+			delete(a.fromIdx, c.From)
+		}
+	}
 	last := len(a.items) - 1
 	delete(a.index, c.Path)
-	a.items[i] = a.items[last]
+	moved := a.items[last]
+	a.items[i] = moved
 	a.items = a.items[:last]
 	if i < len(a.items) {
 		// The swap only moves the entry; its position inside its parent's
 		// child list is untouched, so the slot stays valid.
-		a.index[a.items[i].Path] = i
+		a.index[moved.Path] = i
+		if moved.From != "" {
+			// Preserve first-consumer-wins: only retarget the index when it
+			// pointed at the moved item's old slot (or was removed with c).
+			if j, ok := a.fromIdx[moved.From]; !ok || j == last {
+				a.fromIdx[moved.From] = i
+			}
+		}
 	}
 	a.pending = len(a.items)
+	// The index entry is already gone, so unlink can tell whether a node for
+	// the same path still needs the shared child link.
+	a.unlink(c.parent, c.Path, c.slot)
 }
 
-// unlink removes path from the child list of dir, keeping the swapped-in
-// child's slot accurate whether that child is an entry or a subdirectory.
+// unlink removes path from the child list of dir unless an entry or an
+// internal node still owns that child. Entries and nodes share one child
+// link; removing it for one owner would make the other unreachable from
+// dropSubtree/followRename and could corrupt the slot bookkeeping.
 func (a *Aggregator) unlink(dir, path string, slot int) {
 	node := a.nodes[dir]
-	if node == nil || slot >= len(node.children) || node.children[slot] != path {
+	if node == nil {
 		return
 	}
+	if _, ok := a.index[path]; ok {
+		return
+	}
+	if _, ok := a.nodes[path]; ok {
+		return
+	}
+	if node.childSet == nil {
+		node.childSet = make(map[string]int, len(node.children))
+		for i, c := range node.children {
+			node.childSet[c] = i
+		}
+	}
+	s, ok := node.childSet[path]
+	if !ok {
+		return
+	}
+	if slot >= 0 && slot < len(node.children) && node.children[slot] == path {
+		s = slot
+	}
 	last := len(node.children) - 1
-	node.children[slot] = node.children[last]
+	node.children[s] = node.children[last]
 	node.children = node.children[:last]
-	if slot < len(node.children) {
-		moved := node.children[slot]
+	delete(node.childSet, path)
+	if s < len(node.children) {
+		moved := node.children[s]
+		node.childSet[moved] = s
 		if mi, ok := a.index[moved]; ok {
-			a.items[mi].slot = slot
+			a.items[mi].slot = s
 		} else if mn, ok := a.nodes[moved]; ok {
-			mn.slot = slot
+			mn.slot = s
 		}
 	}
 	if len(node.children) == 0 {
@@ -690,6 +984,7 @@ func (a *Aggregator) Flush() ([]Change, bool) {
 	overflow := a.overflow
 	a.items = nil
 	a.index = make(map[string]int, 1024)
+	a.fromIdx = make(map[string]int, 128)
 	a.nodes = make(map[string]*dirNode, 256)
 	a.pending = 0
 	a.overflow = false

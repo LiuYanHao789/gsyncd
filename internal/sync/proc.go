@@ -218,6 +218,8 @@ func lastLine(s string) string {
 // This is the fix for issue #250, where a dead network made lsyncd respawn
 // rsync as fast as the OS could fork, pinning a core at 100% and filling the
 // log at 6 MB/s.
+// Backoff returns base*2^attempt with up to 20% jitter, capped at max (the
+// jitter is added after the cap, so the true ceiling is 1.2*max).
 func Backoff(attempt int, base, max time.Duration) time.Duration {
 	if base <= 0 {
 		base = time.Second

@@ -74,8 +74,9 @@ type Spec struct {
 	// FullResync overrides the engine-wide periodic full resync for this
 	// sync. Zero inherits the global value set by SetFullResync.
 	FullResync time.Duration
-	// Retries is how often a failing batch is attempted before it is put back
-	// into the window for the next round.
+	// Retries is the total number of attempts for a failing batch (so 3 means
+	// two retries); after that it is put back into the window for the next
+	// round.
 	Retries int
 	// MaxProcesses is the per-sync ceiling on concurrent transfers. Zero means
 	// "only bounded by the global one". It exists because the global cap alone
@@ -153,7 +154,12 @@ type Root struct {
 	// supervisor has to rebuild the watch and then re-transfer everything:
 	// whatever changed while the root was gone left no events at all.
 	lost bool
-	st   Stats
+	// kernelOverflow counts one Overflows episode per batch of kernel
+	// overflow events. Using agg.Overflowed() for this missed a genuine
+	// overflow whenever RootGone/Reattach/periodic resync had already set the
+	// same flag.
+	kernelOverflow bool
+	st             Stats
 	// limit is the per-sync transfer semaphore, nil when the sync inherits the
 	// global one.
 	limit chan struct{}
@@ -194,6 +200,12 @@ func (r *Root) Pending() int { return r.agg.Len() }
 
 // Engine is the running daemon core.
 type Engine struct {
+	// fullEvery is the interval of the periodic wholesale resync, in
+	// nanoseconds. Zero disables it. Stored atomically because the caller may
+	// set it after the engine started running. It is the first field so 64-bit
+	// atomics are aligned on 32-bit architectures.
+	fullEvery int64
+
 	opts  Options
 	log   *logx.Logger
 	roots []*Root
@@ -203,11 +215,6 @@ type Engine struct {
 
 	ctx    context.Context
 	cancel context.CancelFunc
-
-	// fullEvery is the interval of the periodic wholesale resync, in
-	// nanoseconds. Zero disables it. Stored atomically because the caller may
-	// set it after the engine started running.
-	fullEvery int64
 }
 
 // SetFullResync schedules a periodic wholesale resynchronisation of every
@@ -368,7 +375,10 @@ func (e *Engine) Startup(ctx context.Context) error {
 				again := r.pending
 				r.pending = false
 				r.mu.Unlock()
-				if again && ctx.Err() == nil {
+				// A failed startup just armed retryAt; this pending flush must
+				// respect it, or the first retry runs immediately and defeats
+				// the backoff for exactly the full-resync case it protects.
+				if again && ctx.Err() == nil && r.gateOpen(e.now()) {
 					e.flushAsync(r)
 				}
 			}()
@@ -453,9 +463,16 @@ loop:
 	// the same target: one copying a file the other is deleting. Waiting for
 	// the in-flight batch first, then flushing whatever is left, keeps a single
 	// writer per root at all times.
-	e.wait(context.Background(), 30*time.Second)
-	e.FlushAll(context.Background())
-	e.wait(context.Background(), 30*time.Second)
+	// Keep the total below systemd's default TimeoutStopSec=90s: a drain that
+	// outlives it is SIGKILLed anyway, losing the work it was trying to save.
+	e.wait(context.Background(), 20*time.Second)
+	// Bound the drain. context.Background() meant a target that stopped
+	// responding (or an overflow-triggered full resync) could keep the shutdown
+	// walking a multi-terabyte tree with no deadline.
+	drainCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	e.FlushAll(drainCtx)
+	e.wait(context.Background(), 15*time.Second)
 	return err
 }
 
@@ -485,10 +502,15 @@ func (e *Engine) Handle(ev event.Event) {
 		for _, r := range e.roots {
 			// Count episodes, not events: the kernel emits one IN_Q_OVERFLOW
 			// per dropped batch, so a single burst would otherwise read as
-			// nineteen incidents in the status file. r.agg.Overflowed() is
-			// still true from the first event until the next flush, which is
-			// exactly one episode.
-			if !r.agg.Overflowed() {
+			// nineteen incidents in the status file. A dedicated flag is
+			// needed because agg.Overflowed() is also set by
+			// RootGone/Reattach/periodic resync, which used to hide a real
+			// kernel overflow from the counter.
+			r.mu.Lock()
+			count := !r.kernelOverflow
+			r.kernelOverflow = true
+			r.mu.Unlock()
+			if count {
 				e.bump(r, func(s *Stats) { s.Overflows++ })
 			}
 			r.agg.MarkOverflow()
@@ -512,10 +534,14 @@ func (e *Engine) Handle(ev event.Event) {
 	}
 	// A rename can cross two sync roots (mv /data/a/x /data/b/x). The event
 	// carries one From and one Path, and From decides which root it lands in,
-	// but the destination belongs to a different tree. Applying it as one
-	// rename would make the backend join a relative path that starts with
-	// ".." onto its target, i.e. write outside the destination directory.
-	// Split it into a delete here and a create there.
+	// but the destination lies outside this root. Applying it as one rename
+	// would make the backend join a relative path that starts with ".." onto
+	// its target, i.e. write outside the destination directory. Split it into
+	// a delete here and a create there.
+	//
+	// A destination under a nested sync root but still inside this root keeps
+	// the move in this root: nested roots do not fan out (see
+	// nestedroute_test.go, which pins that contract).
 	if ev.Op&event.Move != 0 && ev.From != "" && !watcher.IsUnder(r.Source, ev.Path) {
 		e.Handle(event.Event{Path: ev.From, Op: event.Delete, IsDir: ev.IsDir, At: ev.At})
 		// The destination may be another sync root whose watcher saw nothing
@@ -842,13 +868,21 @@ func (e *Engine) wait(ctx context.Context, d time.Duration) {
 // Close stops accepting new transfers and waits for running ones.
 func (e *Engine) Close() {
 	e.cancel()
-	e.wait(e.ctx, 30*time.Second)
+	// e.ctx is already cancelled, so waiting on it returned immediately and
+	// the documented "waits for running transfers" was not true. Use a fresh
+	// deadline instead.
+	e.wait(context.Background(), 30*time.Second)
 }
 
 // apply transfers one window, retrying with backoff and putting the changes
 // back into the window when every attempt failed.
 func (e *Engine) apply(ctx context.Context, r *Root) {
+	// Taking the window and clearing the episode flag must be atomic with
+	// respect to Handle, or an Overflow arriving in between is counted twice.
+	r.mu.Lock()
 	changes, overflow := r.agg.Flush()
+	r.kernelOverflow = false
+	r.mu.Unlock()
 	if len(changes) == 0 && !overflow {
 		return
 	}
@@ -931,19 +965,15 @@ func (e *Engine) applyRetry(ctx context.Context, r *Root, batch syncpkg.Batch) e
 // readd returns a failed batch to the window so the next round retries exactly
 // those paths instead of restarting the whole tree.
 func (e *Engine) readd(r *Root, changes []aggregate.Change) {
-	for _, c := range changes {
-		// Directly into the window: going through Handle would run these paths
-		// by the filter and the router a second time and count them again in
-		// the events counter, which made the "events" figure drift upwards
-		// every time a backend hiccuped.
-		//
-		// Readd rather than Add so the entry keeps the "still open" answer it
-		// had when the batch was taken. Rebuilding an event from the Op mask
-		// would re-open files whose close had already arrived - the mask of a
-		// batch carries Write but not the close state - and a close_write sync
-		// would then sit on a finished file until max_hold.
-		r.agg.Readd(c)
-	}
+	// Directly into the window: going through Handle would run these paths
+	// by the filter and the router a second time and count them again in the
+	// events counter, which made the "events" figure drift upwards every time
+	// a backend hiccuped.
+	//
+	// ReaddBatch rather than Add so the entries keep the "still open" answer
+	// they had when the batch was taken, and so changes from one failed batch
+	// are not folded into each other (they have no newer/older relation).
+	r.agg.ReaddBatch(changes)
 	r.mu.Lock()
 	r.lastEvent = e.now()
 	r.mu.Unlock()

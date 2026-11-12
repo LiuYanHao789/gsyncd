@@ -15,7 +15,9 @@ func TestExcludesForwardedInReverseOrder(t *testing.T) {
 	r := NewRSync("/src", "/dst", false, nil, nil)
 	r.Excludes = []string{"*.tmp", "!keep.tmp", "cache/"}
 	args := r.baseArgs()
-	want := []string{"--exclude=.gsyncd-target", "--exclude=cache/", "--include=keep.tmp", "--exclude=*.tmp"}
+	// The marker exclude is anchored to the target root; an unanchored rule
+	// ignored a same-named file in every source subdirectory.
+	want := []string{"--exclude=/.gsyncd-target", "--exclude=cache/", "--include=keep.tmp", "--exclude=*.tmp"}
 	var got []string
 	for _, a := range args {
 		if strings.HasPrefix(a, "--exclude=") || strings.HasPrefix(a, "--include=") {

@@ -35,10 +35,29 @@ func CheckTarget(target string) error {
 	if !st.IsDir() {
 		return fmt.Errorf("target %s exists but is not a directory", abs)
 	}
-	if targetMarkerOK(abs) {
+	// Resolve symlinks before deciding what filesystem this is. The lexical
+	// mountinfo check accepted /dev/shm/link -> /srv (which writes to the root
+	// filesystem) and rejected /backup -> /mnt/disk (which is correctly
+	// mounted).
+	real, rerr := filepath.EvalSymlinks(abs)
+	if rerr != nil {
+		return fmt.Errorf("target %s cannot be resolved: %w", abs, rerr)
+	}
+	realSt, err := os.Stat(real)
+	if err != nil || !realSt.IsDir() {
+		return fmt.Errorf("target %s resolves to a non-directory", abs)
+	}
+	if targetMarkerOK(abs, real) {
 		return nil
 	}
-	if mounted, err := onNonRootMount(abs); err == nil && mounted {
+	// A target on a different filesystem than "/" is accepted even without a
+	// marker: that is the mounted backup disk. Same-device targets (bind
+	// mounts of the root filesystem, plain directories) need the marker.
+	rootSt, err := os.Stat("/")
+	if err != nil {
+		return fmt.Errorf("cannot determine the root filesystem: %w", err)
+	}
+	if differentFilesystem(rootSt, realSt) {
 		return nil
 	}
 	return fmt.Errorf("target %s is neither a mount point nor marked with %s; refusing to write "+
@@ -59,24 +78,57 @@ func InitTarget(target string) error {
 	if !st.IsDir() {
 		return fmt.Errorf("target %s exists but is not a directory", abs)
 	}
-	tmp := filepath.Join(abs, TargetMarkerName+".tmp")
-	body := targetMarkerMagic + abs + "\n"
-	if err := os.WriteFile(tmp, []byte(body), 0o644); err != nil {
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return fmt.Errorf("target %s cannot be resolved: %w", abs, err)
+	}
+	// The marker binds to the physical target path. Use a private temp file and
+	// rename so a planted .tmp symlink cannot redirect the write.
+	tmp, err := os.CreateTemp(real, TargetMarkerName+".tmp-*")
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, filepath.Join(abs, TargetMarkerName)); err != nil {
-		_ = os.Remove(tmp)
+	tmpName := tmp.Name()
+	body := targetMarkerMagic + real + "\n"
+	if _, err := tmp.WriteString(body); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	// CreateTemp uses 0600; the marker must be readable by a daemon running as
+	// a different user than the one that initialised the target.
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, filepath.Join(real, TargetMarkerName)); err != nil {
+		_ = os.Remove(tmpName)
 		return err
 	}
 	return nil
 }
 
-func targetMarkerOK(abs string) bool {
-	data, err := os.ReadFile(filepath.Join(abs, TargetMarkerName))
-	if err != nil {
-		return false
+// targetMarkerOK accepts a marker written for either the configured path or
+// the resolved path, so existing deployments keep working after the switch to
+// physical paths.
+func targetMarkerOK(paths ...string) bool {
+	for _, p := range paths {
+		data, err := os.ReadFile(filepath.Join(p, TargetMarkerName))
+		if err != nil {
+			continue
+		}
+		for _, want := range paths {
+			if string(data) == targetMarkerMagic+want+"\n" {
+				return true
+			}
+		}
 	}
-	return string(data) == targetMarkerMagic+abs+"\n"
+	return false
 }
 
 // onNonRootMount reports whether path sits on a mount point other than "/".

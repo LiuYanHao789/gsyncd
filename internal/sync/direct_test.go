@@ -408,3 +408,71 @@ func TestTargetIsEmpty(t *testing.T) {
 		t.Fatal("missing dir reported as empty; nothing can be skipped there")
 	}
 }
+
+func TestOrderRenamesVacatesDestinationFirst(t *testing.T) {
+	renames := []aggregate.Change{
+		{Path: "/r/x/z", From: "/r/a"},
+		{Path: "/r/y", From: "/r/x", Kind: aggregate.KindDir},
+	}
+	got := orderRenames(renames)
+	if len(got) != 2 || got[0].From != "/r/x" || got[1].From != "/r/a" {
+		t.Fatalf("x->y must run first so a->x/z lands in the new x: %+v", got)
+	}
+}
+
+func TestOrderRenamesAncestorFirst(t *testing.T) {
+	renames := []aggregate.Change{
+		{Path: "/r/e/f", From: "/r/d/f"},
+		{Path: "/r/e", From: "/r/d", Kind: aggregate.KindDir},
+	}
+	got := orderRenames(renames)
+	if got[0].From != "/r/d" {
+		t.Fatalf("ancestor directory rename must be first: %+v", got)
+	}
+}
+
+func TestOrderRenamesMarksSwapCycle(t *testing.T) {
+	renames := []aggregate.Change{
+		{Path: "/r/a", From: "/r/b"},
+		{Path: "/r/b", From: "/r/a"},
+	}
+	got := orderRenames(renames)
+	for _, c := range got {
+		if !c.FromCycle || !c.KeepSource {
+			t.Fatalf("swap cycle must copy from source and keep both names: %+v", got)
+		}
+	}
+}
+
+func TestOrderRenamesChainContinuation(t *testing.T) {
+	// Readd can produce c<-f and f<-e in one batch; f must be filled before c
+	// consumes it, otherwise the stale f survives on the target.
+	renames := []aggregate.Change{
+		{Path: "/r/c", From: "/r/f"},
+		{Path: "/r/f", From: "/r/e"},
+	}
+	got := orderRenames(renames)
+	if got[0].Path != "/r/f" {
+		t.Fatalf("f<-e must run before c<-f: %+v", got)
+	}
+}
+
+func TestOrderRenamesAtomicReplaceCopiesConsumer(t *testing.T) {
+	// mv x y && mv z x: y must be copied from source (old x), not renamed from
+	// a target x that z has already overwritten.
+	renames := []aggregate.Change{
+		{Path: "/r/y", From: "/r/x", At: time.Unix(1, 0)},
+		{Path: "/r/x", From: "/r/z", At: time.Unix(2, 0)},
+	}
+	got := orderRenames(renames)
+	for _, c := range got {
+		if c.Path == "/r/y" {
+			if !c.FromCycle || !c.KeepSource {
+				t.Fatalf("consumer of a replaced source must copy: %+v", got)
+			}
+		}
+		if c.Path == "/r/x" && c.FromCycle {
+			t.Fatalf("producer should remain a rename: %+v", got)
+		}
+	}
+}

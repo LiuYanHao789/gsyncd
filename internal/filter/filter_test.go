@@ -191,3 +191,45 @@ func TestFastPathKeepsDescendantRule(t *testing.T) {
 		t.Error("node_modules/ must not match a sibling with the same prefix")
 	}
 }
+
+func TestTripleStarMatchesDirectoryAndContents(t *testing.T) {
+	f := New([]string{"cache/***"})
+	if !f.Match("cache", true) || !f.Match("cache/x", false) || !f.Match("a/cache/x", false) {
+		t.Fatal("cache/*** must match the directory itself and everything below it")
+	}
+	g := New([]string{"cache/**"})
+	if g.Match("cache", true) {
+		t.Fatal("cache/** must not match the directory itself (rsync semantics)")
+	}
+	if !g.Match("cache/x", false) {
+		t.Fatal("cache/** must match contents")
+	}
+}
+
+func TestEscapedLeadingBangIsLiteral(t *testing.T) {
+	f := New([]string{`\!keep`})
+	if !f.Match("!keep", false) {
+		t.Fatal(`\!keep must exclude the literal name "!keep"`)
+	}
+	if f.Match("anything", false) {
+		t.Fatal("escaped pattern must not negate")
+	}
+}
+
+func TestLeadingDoubleStarMatchesZeroSegments(t *testing.T) {
+	f := New([]string{"**/.git/**"})
+	if !f.Match(".git/config", false) {
+		t.Fatal("**/.git/** must match a root-level .git subtree")
+	}
+	g := New([]string{"**/node_modules/***"})
+	if !g.Match("node_modules", true) || !g.Match("node_modules/a", false) {
+		t.Fatal("**/node_modules/*** must match a root-level node_modules tree")
+	}
+}
+
+func TestTripleStarDoesNotMatchRegularFileWithDirName(t *testing.T) {
+	f := New([]string{"cache/***"})
+	if f.Match("cache", false) {
+		t.Fatal("dir/*** is directory-only for the directory itself")
+	}
+}

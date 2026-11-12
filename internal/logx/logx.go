@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -154,7 +155,11 @@ func (l *Logger) Throttlef(key string, interval time.Duration, lv Level, format 
 		// it that way even if a caller ever keys on something unbounded.
 		if len(l.throttle) > 1024 {
 			for k, v := range l.throttle {
-				if v.suppressed == 0 && now.Sub(v.last) > time.Hour {
+				// last.IsZero is the key just inserted below; without this
+				// guard now.Sub(zero) > time.Hour is true and the prune
+				// deletes the new key, so nothing is ever throttled once the
+				// map exceeds the cap.
+				if !v.last.IsZero() && v.suppressed == 0 && now.Sub(v.last) > time.Hour && k != key {
 					delete(l.throttle, k)
 				}
 			}
@@ -227,6 +232,10 @@ type rotator struct {
 	maxFiles int
 	stop     chan struct{}
 	stopOnce sync.Once
+	// closed is set by Close. A nil bw with closed=false means a rotation
+	// failed to reopen; the next Write retries instead of silently dropping
+	// every later line.
+	closed bool
 }
 
 // flushInterval bounds how long a line can sit in the buffer.
@@ -259,7 +268,10 @@ func (r *rotator) flusher() {
 }
 
 func (r *rotator) open() error {
-	f, err := os.OpenFile(r.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	// O_NOFOLLOW: the log path is configured by the operator but lives in a
+	// directory that may be writable by others; following a planted symlink
+	// would append privileged log lines to an arbitrary file.
+	f, err := openLogFile(r.path)
 	if err != nil {
 		return err
 	}
@@ -278,9 +290,17 @@ func (r *rotator) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.bw == nil {
-		// Closed. A logger that is still referenced by a draining goroutine
-		// must drop the line, not dereference a nil buffer and panic.
-		return len(p), nil
+		if r.closed {
+			// A logger still referenced by a draining goroutine must drop the
+			// line, not dereference a nil buffer and panic.
+			return len(p), nil
+		}
+		// The previous rotation could not reopen the file (ENOSPC, read-only
+		// remount). Retry here instead of discarding the rest of the log for
+		// the lifetime of the process.
+		if err := r.open(); err != nil {
+			return 0, err
+		}
 	}
 	// Buffered bytes are not in the file yet, so they have to be counted too:
 	// otherwise a burst of lines smaller than the buffer never rotates.
@@ -299,12 +319,20 @@ func (r *rotator) Write(p []byte) (int, error) {
 
 func (r *rotator) rotate() error {
 	if r.bw != nil {
-		_ = r.bw.Flush()
-		r.bw = nil
+		if err := r.bw.Flush(); err != nil {
+			return err
+		}
 	}
-	if r.f != nil {
-		r.f.Close()
-		r.f = nil
+	if r.maxFiles < 1 {
+		// No archives requested: start the file over instead of unlinking it.
+		// Removing it would work too, but the inode would change under any
+		// "tail -f" that is watching the log, which is the moment an operator
+		// is most likely to be watching it.
+		if err := os.Truncate(r.path, 0); err != nil {
+			return err
+		}
+		r.size = 0
+		return nil
 	}
 	// Shift archives: path.N -> path.N+1
 	for i := r.maxFiles - 1; i >= 1; i-- {
@@ -314,17 +342,32 @@ func (r *rotator) rotate() error {
 			_ = os.Rename(old, next)
 		}
 	}
-	if r.maxFiles >= 1 {
-		_ = os.Rename(r.path, r.path+".1")
-	} else {
-		// No archives requested: start the file over instead of unlinking it.
-		// Removing it would work too, but the inode would change under any
-		// "tail -f" that is watching the log, which is the moment an operator
-		// is most likely to be watching it.
-		_ = os.Truncate(r.path, 0)
+	oldF := r.f
+	if runtime.GOOS == "windows" {
+		// Windows refuses to rename a file that is still open. Close it, and
+		// if the reopen below fails Write retries from a nil buffer rather
+		// than dropping the line.
+		if oldF != nil {
+			_ = oldF.Close()
+		}
+		r.f, r.bw = nil, nil
 	}
-	r.size = 0
-	return r.open()
+	_ = os.Rename(r.path, r.path+".1")
+	// Keep the old descriptor until the new file is open. The previous version
+	// set bw=nil first; when open failed (ENOSPC, read-only remount) every
+	// later Write was discarded as if it had succeeded, disabling logging for
+	// the rest of the process lifetime.
+	if err := r.open(); err != nil {
+		if runtime.GOOS != "windows" {
+			// Put the current file back under its name and keep appending.
+			_ = os.Rename(r.path+".1", r.path)
+		}
+		return err
+	}
+	if oldF != nil && runtime.GOOS != "windows" {
+		_ = oldF.Close()
+	}
+	return nil
 }
 
 // Flush pushes buffered bytes without closing the file.
@@ -341,6 +384,7 @@ func (r *rotator) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.stopOnce.Do(func() { close(r.stop) })
+	r.closed = true
 	var err error
 	if r.bw != nil {
 		err = r.bw.Flush()

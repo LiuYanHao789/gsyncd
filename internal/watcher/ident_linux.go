@@ -51,10 +51,10 @@ type statx struct {
 const (
 	// AT_FDCWD as a uintptr, without relying on a negative constant
 	// conversion.
-	statxAtFDCWD        = ^uintptr(99)
+	statxAtFDCWD           = ^uintptr(99)
 	statxAtSymlinkNofollow = 0x100
-	statxBasicStats     = 0x7ff
-	statxBtime          = 0x800
+	statxBasicStats        = 0x7ff
+	statxBtime             = 0x800
 )
 
 var _ = [1]struct{}{}[unsafe.Sizeof(statx{})-96]

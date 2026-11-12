@@ -76,13 +76,18 @@ type Options struct {
 
 // Tree keeps a recursive watch on a set of roots.
 type Tree struct {
-	be    Backend
-	opts  Options
-	out   chan event.Event
-	done  chan struct{}
-	once  sync.Once
-	mu    sync.Mutex
-	roots map[string]bool
+	be   Backend
+	opts Options
+	out  chan event.Event
+	done chan struct{}
+	once sync.Once
+	// emitMu/outClosed let pump close out after the backend dies without
+	// racing a concurrent emit from an adopter.
+	emitMu    sync.RWMutex
+	outClosed bool
+	outOnce   sync.Once
+	mu        sync.Mutex
+	roots     map[string]bool
 	// lost marks roots whose watch the kernel dropped (the directory was
 	// removed, unmounted, or the watch table was pruned). The path stays in
 	// roots because the operator asked for it to be watched; it is simply
@@ -285,7 +290,10 @@ func (t *Tree) Verify(root string) (bool, error) {
 	prev, ok := t.rootIdent[root]
 	t.mu.Unlock()
 	if !ok {
-		return false, nil
+		// No identity was recorded (AddRoot could not read it). Reporting
+		// "different" made the supervisor call Reattach + a full resync every
+		// ten seconds forever; an error makes it skip until the next restart.
+		return false, fmt.Errorf("%s: no recorded identity", root)
 	}
 	now, err := identityOf(root)
 	if err != nil {
@@ -313,9 +321,13 @@ func (t *Tree) AddRoot(root string) error {
 	// the "lost" mark, or the next Reattach would try to add it twice.
 	delete(t.lost, root)
 	t.roots[root] = true
-	if id, err := identityOf(root); err == nil {
-		t.rootIdent[root] = id
+	id, ierr := identityOf(root)
+	if ierr != nil {
+		delete(t.roots, root)
+		t.mu.Unlock()
+		return fmt.Errorf("%s: cannot read identity: %w", root, ierr)
 	}
+	t.rootIdent[root] = id
 	t.mu.Unlock()
 	if !t.perDirectory() {
 		// A snapshot backend watches whole roots, so the root itself is the
@@ -555,6 +567,7 @@ func (t *Tree) watchOne(p string) (bool, error) {
 
 // pump forwards backend events and extends the watch set for new directories.
 func (t *Tree) pump() {
+	defer t.closeOut()
 	in := t.be.Events()
 	for {
 		select {
@@ -591,7 +604,13 @@ func (t *Tree) handle(ev event.Event) {
 		t.emit(ev)
 		return
 	}
-	if t.perDirectory() && ev.IsDir && (ev.Op&event.Create != 0 || (ev.Op&event.Move != 0 && ev.From == "")) {
+	// Adopt a directory that is new to the watched set. A Move whose source was
+	// not recorded (it lived under an ignored path, or the watch table was
+	// full) is such a case: rekey has nothing to move, and without adoption the
+	// destination and everything already inside it stay invisible.
+	newToTree := ev.Op&event.Create != 0 ||
+		(ev.Op&event.Move != 0 && (ev.From == "" || !t.IsWatched(ev.From)))
+	if t.perDirectory() && ev.IsDir && newToTree {
 		// A new directory appeared: watch it, then re-scan it so files created
 		// between mkdir and add_watch are not lost. Queueing instead of
 		// spawning keeps the goroutine count constant when a bulk copy lands.
@@ -677,10 +696,27 @@ func replacePrefix(p, from, to string) (string, bool) {
 }
 
 func (t *Tree) emit(ev event.Event) {
+	t.emitMu.RLock()
+	defer t.emitMu.RUnlock()
+	if t.outClosed {
+		return
+	}
 	select {
 	case t.out <- ev:
 	case <-t.done:
 	}
+}
+
+// closeOut closes the consumer channel exactly once. Without it a backend
+// whose read loop died left the engine waiting forever: Run selects on the
+// channel and the context, and the context is only cancelled on shutdown.
+func (t *Tree) closeOut() {
+	t.outOnce.Do(func() {
+		t.emitMu.Lock()
+		t.outClosed = true
+		close(t.out)
+		t.emitMu.Unlock()
+	})
 }
 
 // Close stops the tree and the backend.
@@ -690,6 +726,7 @@ func (t *Tree) Close() error {
 		close(t.done)
 		err = t.be.Close()
 		t.addWG.Wait()
+		t.closeOut()
 	})
 	return err
 }

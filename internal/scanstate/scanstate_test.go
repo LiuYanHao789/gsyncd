@@ -130,10 +130,12 @@ func TestFingerprintTracksConfig(t *testing.T) {
 	}
 }
 
-// A run that is killed leaves a half written segment. Records are only appended
-// after the directory they describe has been copied, so the usable prefix must
-// survive and the torn tail must be discarded - never the other way round.
-func TestStoreTornTailKeepsEarlierRecords(t *testing.T) {
+// A torn segment is not evidence that its directories were copied. The
+// end-of-walk seal is the only thing that makes a segment adoptable; without
+// it the whole file is ignored and the next run re-verifies. (The older
+// behaviour adopted any regular .tmp, which could skip files whose copies were
+// still queued when the process was killed.)
+func TestStoreTornSegmentIsIgnored(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "scan")
 	fp := Fingerprint("/src", "/dst", nil)
 	s := Open(path, fp, nil)
@@ -161,21 +163,17 @@ func TestStoreTornTailKeepsEarlierRecords(t *testing.T) {
 	if err := s2.Begin(); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := s2.Lookup("a"); !ok {
-		t.Fatal("intact record before the tear was lost")
-	}
-	if _, ok := s2.Lookup("b"); !ok {
-		t.Fatal("intact record before the tear was lost")
-	}
-	if _, ok := s2.Lookup("c"); ok {
-		t.Fatal("torn record was accepted")
+	for _, p := range []string{"a", "b", "c"} {
+		if _, ok := s2.Lookup(p); ok {
+			t.Fatalf("record %q from an unsealed/torn segment was accepted", p)
+		}
 	}
 	s2.Finish(false)
 }
 
-// An interrupted run keeps its segment and the next run continues from it,
-// which is the whole point of the feature.
-func TestStoreIncompleteRunIsStillUsable(t *testing.T) {
+// An interrupted run must not be adopted: its records may precede the copies
+// they describe. The next run starts from scratch.
+func TestStoreIncompleteRunIsNotAdopted(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "scan")
 	fp := Fingerprint("/src", "/dst", nil)
 	s := Open(path, fp, nil)
@@ -196,8 +194,8 @@ func TestStoreIncompleteRunIsStillUsable(t *testing.T) {
 	if err := s2.Begin(); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := s2.Lookup("a"); !ok {
-		t.Fatal("record from the interrupted run was not picked up")
+	if _, ok := s2.Lookup("a"); ok {
+		t.Fatal("unsealed record from the interrupted run was adopted")
 	}
 	s2.Finish(false)
 }
@@ -210,6 +208,11 @@ func TestStoreUnwritablePathDegrades(t *testing.T) {
 	if err := os.MkdirAll(path+".tmp", 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// Non-empty, so the safe-create path cannot remove it and Begin must fail
+	// rather than follow/replace an object it did not write.
+	if err := os.WriteFile(filepath.Join(path+".tmp", "keep"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	s := Open(path, Fingerprint("/src", "/dst", nil), nil)
 	if err := s.Begin(); err == nil {
 		t.Fatal("Begin() over a directory reported success")
@@ -218,5 +221,33 @@ func TestStoreUnwritablePathDegrades(t *testing.T) {
 	s.Finish(true)
 	if _, ok := s.Lookup("a"); ok {
 		t.Fatal("record was readable from an unwritable store")
+	}
+}
+
+func TestScanTempSymlinkIsNotFollowed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "scan")
+	fp := Fingerprint("/src", "/dst", nil)
+	s := Open(path, fp, nil)
+	if err := s.Begin(); err != nil {
+		t.Fatal(err)
+	}
+	s.Add(rec("a", 1, 1, 1))
+	s.Finish(true) // creates a valid checkpoint
+
+	victim := filepath.Join(dir, "victim")
+	if err := os.WriteFile(victim, []byte("SAFE"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, path+".tmp"); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	s2 := Open(path, fp, nil)
+	if err := s2.Begin(); err != nil {
+		t.Fatal(err)
+	}
+	s2.Finish(true)
+	if got, err := os.ReadFile(victim); err != nil || string(got) != "SAFE" {
+		t.Fatalf("checkpoint .tmp symlink clobbered victim: %q %v", got, err)
 	}
 }

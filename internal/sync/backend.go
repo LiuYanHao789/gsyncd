@@ -15,7 +15,9 @@ type Backend interface {
 	Name() string
 	// Startup performs the initial full synchronisation.
 	Startup(ctx context.Context) error
-	// Apply pushes one batch. It may be called concurrently.
+	// Apply pushes one batch. The engine serialises calls per root (one
+	// backend instance), so implementations need not be safe for concurrent
+	// Apply on the same object; different roots have different backends.
 	Apply(ctx context.Context, batch Batch) error
 	// Close releases resources.
 	Close() error

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -284,6 +285,13 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("%s: %w", path, err)
 	}
 	base := filepath.Dir(path)
+	// Resolve the configuration directory now. With a relative -config path
+	// ("gsyncd -config gsyncd.toml") base used to be ".", so a relative source
+	// stayed relative while the target was made absolute; the overlap guard
+	// then compared incomparable paths and silently passed.
+	if abs, aerr := filepath.Abs(base); aerr == nil {
+		base = abs
+	}
 	if err := cfg.Global.Validate(); err != nil {
 		return Config{}, fmt.Errorf("%s: global: %w", path, err)
 	}
@@ -292,11 +300,95 @@ func Load(path string) (Config, error) {
 			return Config{}, fmt.Errorf("%s: sync %q: %w", path, cfg.Syncs[i].Name, err)
 		}
 	}
+	// Names are checked after Validate has derived the source-basename default;
+	// checking during Parse rejected two unnamed syncs and missed a collision
+	// between an explicit name and a derived one.
+	names := make(map[string]int, len(cfg.Syncs))
+	for i := range cfg.Syncs {
+		name := cfg.Syncs[i].Name
+		if prev, ok := names[name]; ok {
+			return Config{}, fmt.Errorf("%s: sync #%d and sync #%d share the name %q; names must be unique (status and checkpoint paths use them)", path, prev+1, i+1, name)
+		}
+		names[name] = i
+	}
+	// A single sync may not contain its own target, but two syncs can still
+	// point at each other's trees. Both guards pass, and every copy into one
+	// becomes an event for the other: an endless mirror loop. Only local
+	// targets can participate.
+	n := len(cfg.Syncs)
+	targets := make([]string, n)
+	hasTarget := make([]bool, n)
+	sources := make([]string, n)
+	for i := range cfg.Syncs {
+		sources[i] = resolveForOverlap(cfg.Syncs[i].Source)
+		if t, ok := localTargetPath(&cfg.Syncs[i]); ok {
+			targets[i], hasTarget[i] = resolveForOverlap(t), true
+		}
+	}
+	edge := make([][]int, n)
+	for i := 0; i < n; i++ {
+		if !hasTarget[i] {
+			continue
+		}
+		for j := 0; j < n; j++ {
+			if i != j && within(sources[j], targets[i]) {
+				edge[i] = append(edge[i], j)
+			}
+		}
+	}
+	// Pairwise checks miss a three-sync ring A->B->C->A; walk the graph.
+	color := make([]uint8, n) // 0 white, 1 grey, 2 black
+	var stack []int
+	var visit func(i int) bool
+	visit = func(i int) bool {
+		color[i] = 1
+		stack = append(stack, i)
+		for _, j := range edge[i] {
+			if color[j] == 1 {
+				return true
+			}
+			if color[j] == 0 && visit(j) {
+				return true
+			}
+		}
+		stack = stack[:len(stack)-1]
+		color[i] = 2
+		return false
+	}
+	for i := 0; i < n; i++ {
+		if color[i] == 0 && visit(i) {
+			names := make([]string, 0, len(stack))
+			for _, k := range stack {
+				names = append(names, cfg.Syncs[k].Name)
+			}
+			return Config{}, fmt.Errorf("%s: syncs %s mirror into each other in a cycle", path, strings.Join(names, " -> "))
+		}
+	}
 	return cfg, nil
+}
+
+// localTargetPath returns the target path for syncs whose target is a local
+// filesystem path. Remote rsync and rsyncssh targets are opaque here.
+func localTargetPath(s *Sync) (string, bool) {
+	switch s.Mode {
+	case ModeRsyncSSH:
+		return "", false
+	case ModeRsync:
+		if s.Remote {
+			return "", false
+		}
+	}
+	if s.Target == "" {
+		return "", false
+	}
+	return s.Target, true
 }
 
 // Parse builds a Config from TOML text.
 func Parse(src string) (Config, error) {
+	// Editors on Windows commonly save a UTF-8 BOM; TrimSpace does not remove
+	// it, so the first key failed with "expected key = value".
+	src = strings.TrimPrefix(src, "\ufeff")
 	root, err := parseTOML(src)
 	if err != nil {
 		return Config{}, err
@@ -320,7 +412,14 @@ func Parse(src string) (Config, error) {
 		return Config{}, fmt.Errorf("top level: unknown key %q (expected [global] or [[sync]])", k)
 	}
 
-	if g, ok := root["global"].(tomlTable); ok {
+	if gv, present := root["global"]; present {
+		g, ok := gv.(tomlTable)
+		if !ok {
+			// "[[global]]" is a plausible typo for "[global]"; dropping the
+			// whole section silently lost log_file, pid/status files and
+			// limits, and the daemon reported a valid configuration.
+			return Config{}, errors.New("global must be a single [global] table, not an array of tables")
+		}
 		if err := applyGlobal(&cfg.Global, g); err != nil {
 			return Config{}, err
 		}
@@ -346,6 +445,9 @@ func Parse(src string) (Config, error) {
 // it cannot apply: the failure would otherwise only show up as a log line
 // after the first copy had already begun.
 func (g Global) Validate() error {
+	if g.FullResync < 0 {
+		return errors.New("full_resync must not be negative")
+	}
 	if g.Nice < -20 || g.Nice > 19 {
 		return fmt.Errorf("nice %d is out of range, expected -20 to 19", g.Nice)
 	}
@@ -380,6 +482,127 @@ func normKey(k string) string {
 	return strings.ReplaceAll(k, "-", "")
 }
 
+// canonicalKey maps documented aliases onto the setting they write. normKey
+// already folds underscores and case; these are the remaining pairs that name
+// one field under two spellings.
+func canonicalKey(n string) string {
+	switch n {
+	case "exclude":
+		return "excludes"
+	case "rsyncopts":
+		return "rsyncextra"
+	}
+	return n
+}
+
+// checkDuplicateKeys rejects two spellings of the same setting in one table.
+// The parsers apply keys by ranging over a map, so "log_file" plus "logfile"
+// used to make the winner depend on Go's randomised map order.
+func checkDuplicateKeys(section string, t tomlTable) error {
+	if len(t) < 2 {
+		return nil
+	}
+	keys := make([]string, 0, len(t))
+	for k := range t {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	seen := make(map[string]string, len(keys))
+	for _, k := range keys {
+		n := canonicalKey(normKey(k))
+		if prev, ok := seen[n]; ok {
+			return fmt.Errorf("%s: keys %q and %q set the same option", section, prev, k)
+		}
+		seen[n] = k
+	}
+	return nil
+}
+
+// Value kinds that need a real parser, not a numeric prefix scan. A string
+// that fails the parser is a configuration error: "1d" used to become 1 second
+// (a full resync every second), and "100MB" became 100 bytes.
+var (
+	globalValueKinds = map[string]string{
+		"statusinterval": "duration",
+		"watchinterval":  "duration",
+		"fullresync":     "duration",
+		"logmaxsize":     "bytes",
+		"memorylimit":    "bytes",
+	}
+	syncValueKinds = map[string]string{
+		"delay":          "duration",
+		"maxhold":        "duration",
+		"fullresync":     "duration",
+		"bandwidthlimit": "bytes",
+		"rsyncbwlimit":   "bytes",
+	}
+)
+
+func checkValueSyntax(section string, t tomlTable, kinds map[string]string) error {
+	if len(kinds) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(t))
+	for k := range t {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		kind, ok := kinds[canonicalKey(normKey(k))]
+		if !ok {
+			continue
+		}
+		s, isString := t[k].(string)
+		if !isString {
+			continue // numeric values keep their existing semantics
+		}
+		switch kind {
+		case "duration":
+			if _, err := time.ParseDuration(s); err != nil {
+				// Bare integers are seconds, matching seconds() and the
+				// documented max_hold = "-1" disable.
+				if _, nerr := strconv.ParseInt(strings.TrimSpace(s), 10, 64); nerr != nil {
+					return fmt.Errorf("%s: %s = %q is not a valid duration (use forms like 15s, 5m, 1h, or an integer number of seconds)", section, k, s)
+				}
+			}
+		case "bytes":
+			if _, err := parseBytesStrict(s); err != nil {
+				return fmt.Errorf("%s: %s = %q is not a valid size (use a number with optional k/m/g/t, e.g. 500m)", section, k, s)
+			}
+		}
+	}
+	return nil
+}
+
+// parseBytesStrict accepts a plain non-negative integer with an optional
+// k/m/g/t suffix. Unlike asBytes it does not silently accept a numeric prefix
+// or trailing garbage.
+func parseBytesStrict(s string) (int64, error) {
+	s = strings.TrimSpace(strings.ToLower(s))
+	if s == "" {
+		return 0, errors.New("empty")
+	}
+	mult := int64(1)
+	switch s[len(s)-1] {
+	case 'k':
+		mult, s = 1<<10, s[:len(s)-1]
+	case 'm':
+		mult, s = 1<<20, s[:len(s)-1]
+	case 'g':
+		mult, s = 1<<30, s[:len(s)-1]
+	case 't':
+		mult, s = 1<<40, s[:len(s)-1]
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid number %q", s)
+	}
+	if n > (1<<63-1)/mult {
+		return 0, errors.New("value overflows int64")
+	}
+	return n * mult, nil
+}
+
 // isGlobalKey reports whether k is one of the keys applyGlobal understands.
 // Used only to turn a misplaced key into a pointed error message.
 func isGlobalKey(k string) bool {
@@ -393,6 +616,12 @@ func isGlobalKey(k string) bool {
 }
 
 func applyGlobal(g *Global, t tomlTable) error {
+	if err := checkDuplicateKeys("global", t); err != nil {
+		return err
+	}
+	if err := checkValueSyntax("global", t, globalValueKinds); err != nil {
+		return err
+	}
 	for k, v := range t {
 		switch normKey(k) {
 		case "logfile":
@@ -400,7 +629,7 @@ func applyGlobal(g *Global, t tomlTable) error {
 		case "loglevel":
 			g.LogLevel = asString(v)
 		case "logmaxsize":
-			g.LogMaxSize = asInt64(v)
+			g.LogMaxSize = asBytes(v)
 		case "logmaxfiles":
 			g.LogMaxFiles = int(asInt64(v))
 		case "pidfile":
@@ -437,6 +666,12 @@ func applyGlobal(g *Global, t tomlTable) error {
 }
 
 func applySync(t tomlTable) (Sync, error) {
+	if err := checkDuplicateKeys("sync", t); err != nil {
+		return Sync{}, err
+	}
+	if err := checkValueSyntax("sync", t, syncValueKinds); err != nil {
+		return Sync{}, err
+	}
 	// direct is the default: it needs no rsync and no ssh, which is the
 	// whole point of a single static binary.
 	s := Sync{
@@ -472,9 +707,9 @@ func applySync(t tomlTable) (Sync, error) {
 			s.TargetDir = asString(v)
 		case "delay":
 			s.Delay = seconds(v)
-		case "maxhold", "max_hold":
+		case "maxhold":
 			s.MaxHold = seconds(v)
-		case "closewrite", "close_write":
+		case "closewrite":
 			s.CloseWrite = asBool(v)
 		case "delete":
 			switch x := v.(type) {
@@ -482,7 +717,13 @@ func applySync(t tomlTable) (Sync, error) {
 				s.Delete = x
 			case string:
 				switch strings.ToLower(x) {
-				case "true", "yes", "running":
+				case "true", "yes":
+					// Quoted booleans mean the same as the TOML boolean: both
+					// the startup prune and runtime deletes are armed. They
+					// used to map to "running", silently skipping the startup
+					// prune.
+					s.Delete, s.DeleteMode = true, ""
+				case "running":
 					s.Delete, s.DeleteMode = true, "running"
 				case "startup":
 					s.Delete, s.DeleteMode = true, "startup"
@@ -537,7 +778,7 @@ func applySync(t tomlTable) (Sync, error) {
 			s.Fsync = asBool(v)
 		case "verify":
 			s.Verify = asBool(v)
-		case "verifyretries", "verify_retries":
+		case "verifyretries":
 			s.VerifyRetries = int(asInt64(v))
 		case "preserveowner":
 			s.PreserveOwner = strings.ToLower(asString(v))
@@ -596,7 +837,7 @@ func applySync(t tomlTable) (Sync, error) {
 
 	if s.Name == "" {
 		s.Name = filepath.Base(strings.TrimSuffix(s.Source, "/"))
-		if s.Name == "" || s.Name == "." || s.Name == "/" {
+		if s.Name == "" || s.Name == "." || s.Name == ".." || s.Name == "/" {
 			s.Name = "sync"
 		}
 	}
@@ -685,6 +926,9 @@ func checkModeKeys(mode Mode, t tomlTable) error {
 }
 
 func applySSH(sh *SSH, t tomlTable) error {
+	if err := checkDuplicateKeys("ssh", t); err != nil {
+		return err
+	}
 	for k, v := range t {
 		switch normKey(k) {
 		case "binary":
@@ -718,12 +962,20 @@ func (s *Sync) Validate(base string) error {
 		s.Source = filepath.Join(base, s.Source)
 	}
 	s.Source = filepath.Clean(s.Source)
-	st, err := os.Stat(s.Source)
+	if s.Name != "" {
+		// name feeds log/status keys and the auto checkpoint filename. A path
+		// separator or ".." there could redirect the checkpoint outside the
+		// status/log directory.
+		if s.Name == "." || s.Name == ".." || strings.ContainsAny(s.Name, `/\`) {
+			return fmt.Errorf("name %q must not contain path separators or be . / ..", s.Name)
+		}
+	}
+	st, err := os.Lstat(s.Source)
 	if err != nil {
 		return fmt.Errorf("source: %w", err)
 	}
 	if !st.IsDir() {
-		return fmt.Errorf("source %s is not a directory", s.Source)
+		return fmt.Errorf("source %s is not a directory (symlinked roots are not followed; use the resolved path)", s.Source)
 	}
 	switch s.Mode {
 	case ModeRsyncSSH:
@@ -740,6 +992,12 @@ func (s *Sync) Validate(base string) error {
 		}
 		if s.TargetDir == "" {
 			s.TargetDir = s.Source
+		}
+		if strings.HasPrefix(s.TargetDir, "~") {
+			// rsync's remote shell expands ~ for the transfer, while the
+			// move/delete scripts quote the same string literally. The two
+			// would operate on different directories.
+			return fmt.Errorf("target_dir %q: ~ is not expanded consistently; use an absolute remote path", s.TargetDir)
 		}
 	case ModeRsync, ModeDirect:
 		if s.Target == "" {
@@ -765,12 +1023,30 @@ func (s *Sync) Validate(base string) error {
 	if s.Mode == ModeRsync && remote {
 		s.Remote = true
 	}
+	if s.RSyncPasswordFile != "" {
+		daemon := s.Mode == ModeRsync &&
+			(strings.Contains(s.Target, "::") || strings.HasPrefix(s.Target, "rsync://"))
+		if !daemon {
+			return fmt.Errorf("rsync_password_file is only valid for an rsync daemon target (host::module or rsync://), not %q", s.Target)
+		}
+		if runtime.GOOS != "windows" {
+			// Windows synthesises permission bits from the read-only flag, so
+			// every normal file would look group/world-accessible.
+			if st, err := os.Stat(s.RSyncPasswordFile); err == nil && st.Mode().Perm()&0o077 != 0 {
+				return fmt.Errorf("rsync_password_file %s is accessible by group/others (mode %04o); rsync requires a private file", s.RSyncPasswordFile, st.Mode().Perm())
+			}
+		}
+	}
 	if s.Mode != ModeRsyncSSH && !remote {
 		// Relative to the configuration file, like the source above. Resolving
 		// it against the working directory instead would put the target
 		// somewhere under / when started by systemd, and the two paths of one
 		// sync would follow different rules.
-		if !filepath.IsAbs(s.Target) {
+		if !filepath.IsAbs(s.Target) &&
+			!(runtime.GOOS == "windows" && filepath.VolumeName(s.Target) != "") {
+			// Windows drive-relative "C:dir" has a volume name but is not
+			// absolute; joining it onto base produced C:\base\C:dir. Abs below
+			// resolves it against that drive's current directory.
 			s.Target = filepath.Join(base, s.Target)
 		}
 		s.Target = filepath.Clean(s.Target)
@@ -782,6 +1058,21 @@ func (s *Sync) Validate(base string) error {
 			}
 			if within(s.Target, s.Source) {
 				return fmt.Errorf("source %s is inside the target; deleting extras would remove the source", s.Source)
+			}
+			// The lexical checks cannot see a layout such as
+			// source=/data (symlink to /mnt/disk/data) and
+			// target=/mnt/disk/data/backup. Resolve existing components and
+			// repeat the check; the target may not exist yet, so resolve its
+			// parent.
+			rs := resolveForOverlap(s.Source)
+			rt := resolveForOverlap(s.Target)
+			if rs != s.Source || rt != s.Target {
+				if within(rs, rt) {
+					return fmt.Errorf("target %s is inside the source %s after resolving symlinks; a direct copy would mirror itself forever", s.Target, s.Source)
+				}
+				if within(rt, rs) {
+					return fmt.Errorf("source %s is inside the target %s after resolving symlinks; deleting extras would remove the source", s.Source, s.Target)
+				}
 			}
 		}
 	}
@@ -875,10 +1166,13 @@ func IsRemoteTarget(target string) bool {
 	if s := strings.IndexAny(target, `/\`); s >= 0 && s < i {
 		return false
 	}
-	// A Windows drive letter contains a colon but is local.
-	if i == 1 && len(target) > 2 && (target[2] == '\\' || target[2] == '/') {
+	// A drive letter contains a colon but is local. A backslash after it
+	// (C:\dir) marks a Windows path on any host; "C:" with a slash is only a
+	// drive on Windows, so on Unix "h:/data" stays host "h".
+	if i == 1 && len(target) > 2 {
 		c := target[0]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+		isLetter := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		if isLetter && (target[2] == '\\' || runtime.GOOS == "windows") {
 			return false
 		}
 	}
@@ -907,6 +1201,19 @@ func validateRSyncSSHHost(target string) error {
 }
 
 // within reports whether p is at or below root.
+// resolveForOverlap returns the physical path of p when enough of it exists
+// to resolve. The final component may not exist yet (the backend creates the
+// target), so its parent is resolved instead.
+func resolveForOverlap(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	if parent, err := filepath.EvalSymlinks(filepath.Dir(p)); err == nil {
+		return filepath.Join(parent, filepath.Base(p))
+	}
+	return p
+}
+
 func within(root, p string) bool {
 	r := filepath.Clean(root)
 	c := filepath.Clean(p)

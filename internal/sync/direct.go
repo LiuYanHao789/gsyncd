@@ -2,6 +2,7 @@ package sync
 
 import (
 	"bytes"
+	"container/heap"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"hash"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -30,6 +32,9 @@ import (
 // where the original lsyncd forked a full rsync process that then re-walked
 // the directory tree.
 type Direct struct {
+	// st is first so its uint64 fields are 8-byte aligned for atomic
+	// operations on 32-bit architectures.
+	st     Stats
 	Source string
 	Target string
 	// Delete removes target entries that no longer exist on the source.
@@ -127,7 +132,6 @@ type Direct struct {
 	// reading ahead faster than the copies drain.
 	Prefetch int
 
-	st Stats
 	// pruned counts removals seen by pruneDir so the log can be sampled
 	// without a per-entry message (issue #93: 438 GB of log).
 	pruned int
@@ -171,17 +175,20 @@ func NewDirect(source, target string, del bool, workers int, logf func(string, s
 // and the rename fallbacks all share it, and each new fidelity option would
 // otherwise add another positional argument to every one of them.
 type copyOptions struct {
-	Fsync      bool
-	Verify     bool
-	Retries    int
-	FullMode   bool
-	Chown      bool
-	Xattrs     bool
+	Fsync       bool
+	Verify      bool
+	Retries     int
+	FullMode    bool
+	Chown       bool
+	Xattrs      bool
 	Sparse      bool
 	CopySpecial bool
 	Limiter     *rateLimiter
 	SymlinkMode string
 	Logf        func(string, string, ...any)
+	// Stats, when set, receives the retry count. It is nil in tests that call
+	// copyFile directly without a Direct.
+	Stats *Stats
 }
 
 // linkKey identifies a hardlink group by device and inode.
@@ -266,6 +273,7 @@ func (d *Direct) copyOptions() copyOptions {
 		Limiter:     d.limiter,
 		SymlinkMode: d.SymlinkMode,
 		Logf:        d.Logf,
+		Stats:       &d.st,
 	}
 }
 
@@ -786,8 +794,28 @@ func (d *Direct) applySymlink(srcPath, dst string) error {
 // entries are removed and staging files left by an interrupted copy are swept.
 // A missing target directory is created when mk is set.
 func (d *Direct) reconcileDir(ctx context.Context, src, dst string, perm os.FileMode, mk bool, note func(error)) {
+	// ReadDir follows symlinks. A target directory that is a symlink (left by
+	// symlink_mode="all", an operator, or target-side drift) would make
+	// pruneDir/copy/meta operate on the referent, outside the target root.
+	// Check the entry type with Lstat before reading anything below it.
+	//
+	// The target root itself is the exception: CheckTarget deliberately accepts
+	// a configured path that is a symlink to the real mount, and replacing it
+	// here would create a plain directory on the root filesystem and mirror
+	// into that instead.
+	if st, lerr := os.Lstat(dst); lerr == nil && !st.IsDir() &&
+		filepath.Clean(dst) != filepath.Clean(d.Target) {
+		note(os.RemoveAll(dst))
+		if mk {
+			note(mkdirOnce(dst, perm|0o700))
+		}
+		return
+	}
 	ents, err := os.ReadDir(dst)
 	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			note(fmt.Errorf("cannot read target directory %s: %w", dst, err))
+		}
 		if mk {
 			// A file (or symlink) where a directory belongs is a type change
 			// at the source that happened while the daemon was down. Remove
@@ -829,8 +857,15 @@ func (d *Direct) walkCopy(ctx context.Context) error {
 	// The other direction is worse: treating a missing root as empty would make
 	// pruneDir delete the entire target. An unmounted filesystem or a typo in
 	// "source" would then wipe the mirror. Refusing is the only safe answer.
-	if _, err := os.Stat(d.Source); err != nil {
+	// Lstat, not Stat: a symlinked root is not a directory this backend can
+	// walk safely. Stat accepted it, then the walk treated the root as a
+	// symlink entry (removing the target root when the link pointed outside)
+	// while still descending through it via ReadDir. Refusing is the only
+	// unambiguous behaviour; operators can point source at the resolved path.
+	if st, err := os.Lstat(d.Source); err != nil {
 		return fmt.Errorf("source root is not usable, refusing to sync: %w", err)
+	} else if !st.IsDir() {
+		return fmt.Errorf("source root %s is not a directory (symlinked roots are not followed; use the resolved path)", d.Source)
 	}
 	// A full target must stop the pass, not be hammered with every remaining
 	// file. The cancellation is internal to this walk; the caller's context is
@@ -1042,6 +1077,10 @@ func (d *Direct) walkCopy(ctx context.Context) error {
 		if rerr != nil {
 			return nil
 		}
+		// Checkpoint records and walkLess are defined in slash form. On
+		// Windows filepath.Rel returns backslashes, which made the forward
+		// cursor degrade to a whole-string comparison and lost reuse.
+		rel = filepath.ToSlash(rel)
 		// Walk visits a directory before its children and never comes back to
 		// it, so a frame is finished the moment a path outside it is visited.
 		for len(frames) > 0 {
@@ -1116,9 +1155,10 @@ func (d *Direct) walkCopy(ctx context.Context) error {
 			if tracking {
 				fr.hash = scanstate.NewHasher()
 				// The record is only usable when the target directory still
-				// carries the timestamp the record expects: that is the only
-				// evidence available without reading the target, and any hand
-				// edit, stray write or restore changes it.
+				// carries the timestamp the record expects. This is an
+				// accelerator, not proof: an in-place edit of an existing
+				// file does NOT change the parent directory mtime. Use
+				// -verify-content when target-side drift must be detected.
 				base, ok := d.scan.Lookup(rel)
 				if ok {
 					checked++
@@ -1493,19 +1533,38 @@ var ErrVerifyMismatch = errors.New("content verification mismatch")
 // is read back and hashed before the rename. A mismatch retries from scratch;
 // the previously correct target is untouched until the rename, so a failed
 // verification never destroys good data.
+// errSourceChanged means the path no longer names the inode the walk stat'ed.
+// copyFile retries once with fresh metadata; on a live tree this is normal.
+var errSourceChanged = errors.New("source changed while copying")
+
 func copyFile(src, dst string, info os.FileInfo, opts copyOptions) error {
 	if opts.Retries < 0 {
 		opts.Retries = 0
 	}
 	var last error
+	identityRetried := false
 	for attempt := 0; attempt <= opts.Retries; attempt++ {
 		err := copyFileOnce(src, dst, info, opts)
 		if err == nil {
 			return nil
 		}
+		if errors.Is(err, errSourceChanged) && !identityRetried {
+			// A live tree (editor save, database checkpoint) legitimately
+			// replaces files atomically while a long walk is queued. Re-stat and
+			// retry once with the new metadata instead of failing the whole pass.
+			identityRetried = true
+			if fi, serr := os.Lstat(src); serr == nil && fi.Mode().IsRegular() {
+				info = fi
+				attempt--
+				continue
+			}
+		}
 		last = err
 		if !opts.Verify || !errors.Is(err, ErrVerifyMismatch) {
 			return err
+		}
+		if opts.Stats != nil {
+			atomic.AddUint64(&opts.Stats.Retries, 1)
 		}
 		warnf(opts.Logf, "content verification failed for %s (attempt %d/%d): %v", dst, attempt+1, opts.Retries+1, err)
 		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
@@ -1519,6 +1578,15 @@ func copyFileOnce(src, dst string, info os.FileInfo, opts copyOptions) error {
 		return err
 	}
 	defer in.Close()
+	// The walk's Lstat described a regular file. Verify the descriptor is the
+	// same object before reading it; otherwise a path swapped for a symlink or
+	// another inode between the stat and the open would smuggle unrelated
+	// content into the mirror.
+	if fi, serr := in.Stat(); serr != nil {
+		return serr
+	} else if !os.SameFile(info, fi) || !fi.Mode().IsRegular() {
+		return fmt.Errorf("%w: %s (expected %s, opened %s)", errSourceChanged, src, info.Mode().Type(), fi.Mode().Type())
+	}
 
 	var srcHash hash.Hash
 	if opts.Verify {
@@ -1642,8 +1710,20 @@ func copyFileOnce(src, dst string, info os.FileInfo, opts copyOptions) error {
 		// destination: that would turn a transient error (ESTALE/EIO) into
 		// the loss of the previously correct target file.
 		if runtime.GOOS == "windows" {
-			if rmErr := os.Remove(dst); rmErr == nil {
-				err = os.Rename(tmpName, dst)
+			// Move the existing file aside instead of deleting it. If the
+			// retry then fails (AV lock, path length, transient sharing
+			// error), the previously correct target copy is restored rather
+			// than destroyed.
+			// A unique name in the staging namespace: a fixed name could
+			// collide with a legitimate mirrored file and sweepTemp ignores it.
+			backup := filepath.Join(filepath.Dir(dst),
+				fmt.Sprintf("%sold-%d", tmpPrefix, nextTmpSeq()))
+			if mvErr := os.Rename(dst, backup); mvErr == nil {
+				if err = os.Rename(tmpName, dst); err == nil {
+					_ = os.Remove(backup)
+				} else {
+					_ = os.Rename(backup, dst)
+				}
 			}
 		}
 		if err != nil {
@@ -1719,16 +1799,7 @@ func (d *Direct) Apply(ctx context.Context, b Batch) error {
 			rest = append(rest, c)
 		}
 	}
-	// Ancestor renames must run before renames of their descendants: a file
-	// renamed inside a directory that is itself renamed is retargeted to the
-	// new directory, which has to exist on the target first.
-	sort.SliceStable(renames, func(i, j int) bool {
-		di, dj := pathDepth(renames[i].From), pathDepth(renames[j].From)
-		if di != dj {
-			return di < dj
-		}
-		return renames[i].From < renames[j].From
-	})
+	renames = orderRenames(renames)
 
 	// Directories whose metadata has to be restored after the batch. Copying
 	// a file changes its parent's mtime, so the parent can only be stamped
@@ -1899,6 +1970,17 @@ func (d *Direct) Apply(ctx context.Context, b Batch) error {
 	if skipped > 0 {
 		d.Logf("warn", "%d changes not applied: %v", skipped, ctx.Err())
 	}
+	if firstErr == nil {
+		// A PrevFrom recorded on a change that is not itself a rename (Readd
+		// merging a stale rename into a newer write, or the From==Path fold)
+		// was never consumed by applyRename. Clean those names now; the
+		// source-existence guard keeps a recreated path alive.
+		for _, c := range b.Changes {
+			if len(c.PrevFrom) > 0 {
+				d.removePrevFrom(c)
+			}
+		}
+	}
 	if firstErr != nil {
 		return firstErr
 	}
@@ -1915,6 +1997,191 @@ func (d *Direct) Apply(ctx context.Context, b Batch) error {
 // are routed before they get here; this is the belt to that suspenders.
 // pathDepth counts path components; used to apply ancestors before
 // descendants.
+
+// orderRenames sorts a batch of renames so every dependency is applied before
+// the rename that needs it. Two dependencies matter:
+//
+//   - an ancestor's From must be renamed before a descendant's From, so the
+//     target parent exists;
+//   - if a rename's destination lies at or below another rename's From, the
+//     other rename has to vacate that name first. Sorting only by From depth
+//     let "mv x y; mkdir x; mv a x/z" apply a->x/z before x->y, silently
+//     placing z inside the old x (which then became y).
+//
+// The graph is deterministic; a cycle (which should not occur for real
+// filesystem renames) falls back to the stable (depth, From, Path) order.
+func orderRenames(renames []aggregate.Change) []aggregate.Change {
+	n := len(renames)
+	if n < 2 {
+		return renames
+	}
+	order := make([]int, n)
+	rank := make([]int, n)
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		a, b := renames[order[i]], renames[order[j]]
+		da, db := pathDepth(a.From), pathDepth(b.From)
+		if da != db {
+			return da < db
+		}
+		if a.From != b.From {
+			return a.From < b.From
+		}
+		return a.Path < b.Path
+	})
+	for r, idx := range order {
+		rank[idx] = r
+	}
+
+	// Dependencies only exist between paths on the same ancestor chain. Look
+	// each path's ancestors up in a From index instead of comparing every pair:
+	// an n x n edge matrix at the 500k batch cap would allocate gigabytes.
+	byFrom := make(map[string]int, n)
+	byPath := make(map[string]int, n)
+	for i := range renames {
+		f := filepath.ToSlash(renames[i].From)
+		if _, ok := byFrom[f]; !ok {
+			byFrom[f] = i
+		}
+		if _, ok := byPath[filepath.ToSlash(renames[i].Path)]; !ok {
+			byPath[filepath.ToSlash(renames[i].Path)] = i
+		}
+	}
+	adj := make([][]int, n)
+	indeg := make([]int, n)
+	seenEdge := make(map[[2]int]bool, n)
+	addEdge := func(from, to int) {
+		if from == to || seenEdge[[2]int{from, to}] {
+			return
+		}
+		seenEdge[[2]int{from, to}] = true
+		adj[from] = append(adj[from], to)
+		indeg[to]++
+	}
+	for i := range renames {
+		// A rename whose From is a strict ancestor of this destination must
+		// run first so the destination name is free. The exact-name case is
+		// handled below by copying: whether the consumer (this change) or the
+		// producer is older depends on the workload (mv x y && mv z x versus a
+		// Readd-reconstructed chain), and source content is always correct.
+		dst := filepath.ToSlash(renames[i].Path)
+		p := dst
+		for {
+			if j, ok := byFrom[p]; ok && j != i && p != dst {
+				addEdge(j, i)
+			}
+			parent := path.Dir(p)
+			if parent == p {
+				break
+			}
+			p = parent
+		}
+		// A rename that creates a strict ancestor of this change's source must
+		// run first (moving a child out of a directory created in this window).
+		p = filepath.ToSlash(renames[i].From)
+		for {
+			parent := path.Dir(p)
+			if parent == p {
+				break
+			}
+			p = parent
+			if j, ok := byPath[p]; ok && j != i {
+				addEdge(j, i)
+			}
+		}
+		// Ancestor-From renames run before descendant-From renames.
+		p = filepath.ToSlash(renames[i].From)
+		for {
+			parent := path.Dir(p)
+			if parent == p {
+				break
+			}
+			p = parent
+			if j, ok := byFrom[p]; ok && j != i {
+				addEdge(j, i)
+			}
+		}
+	}
+	// A rename whose source name is another rename's destination must copy
+	// from the source instead of renaming stale target content:
+	//   mv x y && mv z x     (y copies source y = old x)
+	//   mv a b; mv c a; mv b d  (d copies source d)
+	// KeepSource protects that destination name from the cleanup pass.
+	for i := range renames {
+		if j, ok := byPath[filepath.ToSlash(renames[i].From)]; ok && j != i {
+			renames[i].FromCycle = true
+			renames[i].KeepSource = true
+		}
+	}
+
+	h := &rankHeap{rank: rank}
+	for i := 0; i < n; i++ {
+		if indeg[i] == 0 {
+			heap.Push(h, i)
+		}
+	}
+	used := make([]bool, n)
+	out := make([]aggregate.Change, 0, n)
+	for h.Len() > 0 {
+		idx := heap.Pop(h).(int)
+		if used[idx] {
+			continue
+		}
+		used[idx] = true
+		out = append(out, renames[idx])
+		for _, j := range adj[idx] {
+			indeg[j]--
+			if indeg[j] == 0 {
+				heap.Push(h, j)
+			}
+		}
+	}
+	if len(out) == n {
+		return out
+	}
+	// A dependency cycle is the normal three-step swap:
+	//   mv a tmp; mv b a; mv tmp b
+	// Applying renames sequentially would overwrite one side. Copy every
+	// remaining change from the source instead, and keep any source name that
+	// is also a destination in the batch.
+	allPaths := make(map[string]bool, n)
+	for i := range renames {
+		allPaths[filepath.ToSlash(renames[i].Path)] = true
+	}
+	for _, idx := range order {
+		if used[idx] {
+			continue
+		}
+		renames[idx].FromCycle = true
+		if allPaths[filepath.ToSlash(renames[idx].From)] || renames[idx].From == renames[idx].Path {
+			renames[idx].KeepSource = true
+		}
+		out = append(out, renames[idx])
+	}
+	return out
+}
+
+// rankHeap pops available indices in the deterministic (depth, From, Path)
+// order computed by orderRenames.
+type rankHeap struct {
+	items []int
+	rank  []int
+}
+
+func (h *rankHeap) Len() int           { return len(h.items) }
+func (h *rankHeap) Less(i, j int) bool { return h.rank[h.items[i]] < h.rank[h.items[j]] }
+func (h *rankHeap) Swap(i, j int)      { h.items[i], h.items[j] = h.items[j], h.items[i] }
+func (h *rankHeap) Push(x any)         { h.items = append(h.items, x.(int)) }
+func (h *rankHeap) Pop() any {
+	old := h.items
+	n := len(old)
+	x := old[n-1]
+	h.items = old[:n-1]
+	return x
+}
+
 func pathDepth(p string) int {
 	return strings.Count(filepath.ToSlash(p), "/")
 }
@@ -1964,7 +2231,7 @@ func (d *Direct) applyRename(ctx context.Context, c aggregate.Change) error {
 	// served by renaming the old target copy: that would move the stale file
 	// (or its stale mode/owner) to the new name. Attrib counts because mode
 	// and mtime may have changed without a Write.
-	dirty := c.Op&(event.Create|event.Write|event.Attrib) != 0
+	dirty := c.Op&(event.Create|event.Write|event.Attrib) != 0 || c.FromCycle
 	if !dirty {
 		if err := os.Rename(srcDst, dstDst); err == nil {
 			d.removePrevFrom(c)
@@ -2015,10 +2282,27 @@ func (d *Direct) applyRename(ctx context.Context, c aggregate.Change) error {
 		// keep an old copy under the new name.
 		_ = os.RemoveAll(dstDst)
 	}
-	_ = os.RemoveAll(srcDst)
+	// A cycle member's source name is another member's destination; removing it
+	// here would delete the file the other copy just wrote. Also keep the old
+	// target name when the source path exists again: a rename readded from a
+	// failed batch may describe a move that was later partially undone.
+	if !c.KeepSource && filepath.Clean(srcDst) != filepath.Clean(dstDst) &&
+		sourceGone(c.From) {
+		_ = os.RemoveAll(srcDst)
+	}
 	d.removePrevFrom(c)
 	atomic.AddUint64(&d.st.Files, 1)
 	return nil
+}
+
+// sourceGone reports that p no longer exists at the source. Unknown errors are
+// treated as "still there": deleting a target copy is the irreversible action.
+func sourceGone(p string) bool {
+	if p == "" {
+		return false
+	}
+	_, err := os.Lstat(p)
+	return errors.Is(err, os.ErrNotExist)
 }
 
 // removePrevFrom deletes the target copies of earlier rename sources folded
@@ -2026,6 +2310,14 @@ func (d *Direct) applyRename(ctx context.Context, c aggregate.Change) error {
 func (d *Direct) removePrevFrom(c aggregate.Change) {
 	for _, pf := range c.PrevFrom {
 		if pf == c.Path || pf == c.From {
+			continue
+		}
+		// A path that exists again at the source was recreated inside the same
+		// window ("mv a b; mv c b; mv aa a" leaves PrevFrom=[a] on b while a
+		// is live again). Deleting the target copy unconditionally removed the
+		// freshly applied file. If the source cannot be inspected, leave the
+		// target alone: the next event or a resync will settle it.
+		if _, err := os.Lstat(pf); err == nil || !errors.Is(err, os.ErrNotExist) {
 			continue
 		}
 		if rel, err := d.relInside(pf); err == nil {
@@ -2336,7 +2628,6 @@ func applyMeta(src, dst string, info os.FileInfo, opts copyOptions) {
 		})
 	}
 }
-
 
 // symlinkText returns the link text to write on the target. Links resolving
 // inside srcRoot are mirrored (absolute ones rewritten under dstRoot); links

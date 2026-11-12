@@ -34,7 +34,7 @@ import (
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
-var version = "0.5.1"
+var version = "0.5.2"
 
 // envReloaded marks the process that replaced itself for a SIGHUP reload. It
 // must not daemonize again: it already has the right session and pid, and a
@@ -65,6 +65,7 @@ type flags struct {
 	verifySample  int
 	verifyWorkers int
 	watchEvery    time.Duration
+	watchEverySet bool
 	fullResync    time.Duration
 	printVer      bool
 }
@@ -92,12 +93,21 @@ func parseFlags(args []string) (flags, error) {
 	if err := fs.Parse(args); err != nil {
 		return f, err
 	}
+	fs.Visit(func(fl *flag.Flag) {
+		if fl.Name == "watch-interval" {
+			f.watchEverySet = true
+		}
+	})
 	return f, nil
 }
 
 func run() error {
 	f, err := parseFlags(os.Args[1:])
 	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			// The flag package already printed the usage; -h is a success.
+			return nil
+		}
 		return err
 	}
 	if f.printVer {
@@ -134,7 +144,9 @@ func run() error {
 	if f.nodaemon {
 		cfg.Global.Nodaemon = true
 	}
-	if f.watchEvery > 0 {
+	if f.watchEverySet {
+		// Explicit -watch-interval 0 must be able to reset a configured value
+		// (0 means "use the platform default").
 		cfg.Global.WatchInterval = f.watchEvery
 	}
 	if f.fullResync >= 0 {
@@ -262,7 +274,13 @@ func run() error {
 		if err := writePidFile(cfg.Global.PidFile); err != nil {
 			return err
 		}
-		defer os.Remove(cfg.Global.PidFile)
+		defer func() {
+			// Remove while the flock is still held: releasing first lets a
+			// restart acquire the lock and then read this dying process's pid
+			// file, refusing to start.
+			_ = os.Remove(cfg.Global.PidFile)
+			releasePidLock()
+		}()
 	}
 
 	// Build one engine spec per configured sync.
@@ -404,7 +422,12 @@ func run() error {
 			return buildStatus(eng, tree, cfg, ph)
 		})
 		sw.Start()
-		defer sw.Stop()
+		defer func() {
+			sw.Stop()
+			if err := sw.Err(); err != nil {
+				logger.Errorf("status file %s: %v", cfg.Global.StatusFile, err)
+			}
+		}()
 	}
 
 	for _, s := range cfg.Syncs {
@@ -555,27 +578,37 @@ func excludeAll(syncs []config.Sync, logger *logx.Logger) func(string) bool {
 	}
 	ents := make([]entry, 0, len(syncs))
 	for _, s := range syncs {
-		if f := filter.New(s.Excludes); !f.Empty() {
-			ents = append(ents, entry{src: s.Source, f: f})
-		}
+		// Include syncs with no excludes: the nested-root owner may be exactly
+		// that sync, and omitting it let an outer filter hide its paths.
+		ents = append(ents, entry{src: s.Source, f: filter.New(s.Excludes)})
 	}
 	if len(ents) == 0 {
 		return nil
 	}
 	return func(path string) bool {
-		for _, e := range ents {
-			if !watcher.IsUnder(e.src, path) {
+		// The owning sync is the most specific (longest) root, matching the
+		// engine's lookup. Consulting every ancestor's filter let an outer
+		// sync's excludes hide a path that a nested sync needs.
+		var best *entry
+		for i := range ents {
+			if !watcher.IsUnder(ents[i].src, path) {
 				continue
 			}
-			rel := strings.TrimPrefix(path, e.src)
-			rel = strings.TrimPrefix(strings.TrimPrefix(rel, string(filepath.Separator)), "/")
-			if rel == "" {
-				continue
+			if best == nil || len(ents[i].src) > len(best.src) {
+				best = &ents[i]
 			}
-			if e.f.Match(filepath.ToSlash(rel), true) {
-				logger.Debugf("excluding %s", path)
-				return true
-			}
+		}
+		if best == nil || best.f.Empty() {
+			return false
+		}
+		rel := strings.TrimPrefix(path, best.src)
+		rel = strings.TrimPrefix(strings.TrimPrefix(rel, string(filepath.Separator)), "/")
+		if rel == "" {
+			return false
+		}
+		if best.f.Match(filepath.ToSlash(rel), true) {
+			logger.Debugf("excluding %s", path)
+			return true
 		}
 		return false
 	}
@@ -591,7 +624,10 @@ func maxHold(d time.Duration) time.Duration {
 	return d
 }
 
-// runVerify implements -verify-tree and -verify-content. Both are read-only:
+// runVerify implements -verify-tree and -verify-content. Neither modifies the
+// mirrored content; -verify-content does create one temporary probe file in
+// the target root to measure timestamp resolution and removes it immediately
+// (a killed run can leave a .gsyncd-tmp-* file, which later runs ignore).
 // they never write to the target and never need the guard marker.
 func runVerify(cfg config.Config, structural, content bool, sample, workers int) error {
 	if sample < 0 {
@@ -877,12 +913,13 @@ func buildStatus(eng *engine.Engine, tree *watcher.Tree, cfg config.Config, ph *
 	return doc
 }
 
-// checkCloseWrite refuses close_write on a backend that cannot report closes.
+// checkCloseWrite refuses close_write when a backend explicitly reports that it
+// cannot observe closes. A backend that does not implement CloseReporter is
+// assumed capable (test fakes and third-party backends may not expose it).
 //
-// Without it the option would silently degrade to "flush at max_hold only": the
-// poll backend sees that a file changed, never that a writer closed it, so every
-// write would look permanently open. An operator who asked for "wait until it is
-// written" and got "wait up to max_hold" has no way to notice from the logs.
+// Without this check the option would silently degrade to "flush at max_hold
+// only": the poll backend sees that a file changed, never that a writer closed
+// it, so every write would look permanently open.
 func checkCloseWrite(be watcher.Backend, syncs []config.Sync) error {
 	rep, ok := be.(watcher.CloseReporter)
 	if !ok || rep.ReportsClose() {
@@ -950,13 +987,48 @@ func writePidFile(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
+	// The flock closes the check-then-write race: two starters can no longer
+	// both read a stale/absent file and both decide to run.
+	if err := acquirePidLock(path); err != nil {
+		return err
+	}
 	if data, err := os.ReadFile(path); err == nil {
 		if other, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil && other != os.Getpid() && pidAlive(other) {
+			releasePidLock()
 			return fmt.Errorf("another gsyncd is already running with pid %d (pid file %s); "+
 				"remove the file if that is wrong", other, path)
 		}
 	}
-	return os.WriteFile(path, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644)
+	// Write via a temp file so a reader never sees a truncated pid.
+	f, err := os.CreateTemp(filepath.Dir(path), ".gsyncd-pid-*")
+	if err != nil {
+		releasePidLock()
+		return err
+	}
+	tmp := f.Name()
+	if _, err := fmt.Fprintf(f, "%d\n", os.Getpid()); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		releasePidLock()
+		return err
+	}
+	if err := f.Chmod(0o644); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		releasePidLock()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		releasePidLock()
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		releasePidLock()
+		return err
+	}
+	return nil
 }
 
 func goVersion() string { return strings.TrimPrefix(runtimeVersion(), "go") }

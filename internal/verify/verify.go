@@ -340,7 +340,10 @@ func Content(source, target string, opts ContentOptions) (Result, error) {
 		// The worker lstats each subject; d_type can be DT_UNKNOWN on some
 		// filesystems, and opening a FIFO to hash it would block forever.
 		if opts.SamplePercent > 0 && opts.SamplePercent < 100 {
-			if int(crc32.ChecksumIEEE([]byte(rel)))%100 >= opts.SamplePercent {
+			// Keep the value unsigned: converting a uint32 above MaxInt to int
+			// on a 32-bit build produced a negative remainder, so nearly every
+			// file was sampled regardless of the requested percentage.
+			if crc32.ChecksumIEEE([]byte(rel))%100 >= uint32(opts.SamplePercent) {
 				return nil
 			}
 		}
@@ -378,7 +381,10 @@ func probeGranularity(dir string) time.Duration {
 	// The probe file changes the directory mtime; restore it so a later
 	// daemon start still sees the checkpoint evidence it had before.
 	pre, _ := os.Stat(dir)
-	f, err := os.CreateTemp(dir, ".gsyncd-mtime-*")
+	// Use the tmp prefix the target-tree filter already ignores: a SIGKILL
+	// between create and remove left a file that the next -verify-tree
+	// reported as "extra".
+	f, err := os.CreateTemp(dir, tmpPrefix+"mtime-*")
 	if err != nil {
 		return 0
 	}

@@ -723,3 +723,67 @@ func TestRemoteRsyncTargetIsNotResolved(t *testing.T) {
 		t.Fatal("remote target was not inferred as Remote")
 	}
 }
+
+func TestParseRejectsDuplicateAndAliasKeys(t *testing.T) {
+	cases := []struct{ name, doc string }{
+		{"duplicate raw key", "[[sync]]\nsource='/a'\ntarget='/b'\ntarget='/c'\n"},
+		{"alias log keys", "[global]\nlog_file='/a'\nlogfile='/b'\n[[sync]]\nsource='/a'\ntarget='/b'\n"},
+		{"alias exclude keys", "[[sync]]\nsource='/a'\ntarget='/b'\nexclude=['x']\nexcludes=['y']\n"},
+	}
+	for _, c := range cases {
+		if _, err := Parse(c.doc); err == nil {
+			t.Errorf("%s: expected an error", c.name)
+		}
+	}
+}
+
+func TestParseRejectsArrayGlobal(t *testing.T) {
+	_, err := Parse("[[global]]\ntarget_guard=false\n[[sync]]\nsource='/a'\ntarget='/b'\n")
+	if err == nil || !strings.Contains(err.Error(), "single [global]") {
+		t.Fatalf("[[global]] must be rejected, got %v", err)
+	}
+}
+
+func TestQuotedDeleteTruePrunesAtStartup(t *testing.T) {
+	cfg, err := Parse("[[sync]]\nsource='/a'\ntarget='/b'\ndelete='true'\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := cfg.Syncs[0]
+	if !s.StartupDelete() || !s.RunningDelete() {
+		t.Fatalf("delete=\"true\" must arm both passes: startup=%v running=%v", s.StartupDelete(), s.RunningDelete())
+	}
+}
+
+func TestRejectsInvalidDurationAndSize(t *testing.T) {
+	docs := []string{
+		"[global]\nfull_resync='1d'\n[[sync]]\nsource='/a'\ntarget='/b'\n",
+		"[[sync]]\nsource='/a'\ntarget='/b'\ndelay='2 minutes'\n",
+		"[global]\nlog_max_size='100MB'\n[[sync]]\nsource='/a'\ntarget='/b'\n",
+	}
+	for _, doc := range docs {
+		if _, err := Parse(doc); err == nil {
+			t.Errorf("expected invalid duration/size to be rejected: %q", doc)
+		}
+	}
+}
+
+func TestValidateRejectsSymlinkSourceRootAndUnsafeName(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	s := Sync{Name: "x", Source: link, Target: filepath.Join(root, "dst"), Mode: ModeDirect}
+	if err := s.Validate(root); err == nil || !strings.Contains(err.Error(), "symlinked roots") {
+		t.Fatalf("symlink source root must be rejected, got %v", err)
+	}
+	s = Sync{Name: "../escape", Source: real, Target: filepath.Join(root, "dst"), Mode: ModeDirect}
+	if err := s.Validate(root); err == nil || !strings.Contains(err.Error(), "path separators") {
+		t.Fatalf("unsafe name must be rejected, got %v", err)
+	}
+}

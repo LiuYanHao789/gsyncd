@@ -20,6 +20,9 @@ type Pattern struct {
 	// wildcard records a `**` segment, which makes the pattern length
 	// variable and rules out the window scan in matchParts.
 	wildcard bool
+	// tripleStar records a trailing `***`, which (unlike `**`) matches the
+	// directory itself as well as everything below it.
+	tripleStar bool
 	// single marks an unanchored one-segment pattern such as `*.tmp` or
 	// `node_modules`. Those can be tested by walking separators instead of
 	// splitting the path, which is the difference between one allocation per
@@ -45,11 +48,22 @@ func New(patterns []string) *Filter {
 	f := &Filter{}
 	for _, p := range patterns {
 		p = strings.TrimSpace(p)
-		if p == "" || strings.HasPrefix(p, "#") {
+		if p == "" {
+			continue
+		}
+		// rsync escapes a literal leading ! or # with a backslash. Treating
+		// \!name as a negation made an intentionally excluded name reappear
+		// at runtime (the startup rsync pass excludes it).
+		escaped := false
+		if len(p) > 1 && p[0] == '\\' && (p[1] == '!' || p[1] == '#') {
+			p = p[1:]
+			escaped = true
+		}
+		if !escaped && strings.HasPrefix(p, "#") {
 			continue
 		}
 		pat := Pattern{raw: p}
-		if strings.HasPrefix(p, "!") {
+		if !escaped && strings.HasPrefix(p, "!") {
 			pat.negate = true
 			p = p[1:]
 		}
@@ -62,10 +76,16 @@ func New(patterns []string) *Filter {
 			p = strings.TrimPrefix(p, "/")
 		}
 		pat.segments = strings.Split(p, "/")
-		for _, s := range pat.segments {
-			if s == "**" {
+		for i, s := range pat.segments {
+			if s == "**" || s == "***" {
 				pat.wildcard = true
-				break
+			}
+			// Only a trailing *** is special (directory + contents). Anywhere
+			// else rsync treats it as an ordinary segment glob; applying the
+			// directory-self rule there made "***/node_modules" match every
+			// path.
+			if s == "***" && i == len(pat.segments)-1 {
+				pat.tripleStar = true
 			}
 		}
 		pat.single = !pat.anchored && !pat.wildcard && len(pat.segments) == 1
@@ -166,18 +186,28 @@ func (p Pattern) matchParts(parts []string, dir bool) bool {
 	if limit <= 0 {
 		return false
 	}
+	n := len(p.segments)
+	if n == 0 {
+		return false
+	}
 	if p.wildcard {
-		// A `**` makes the pattern length variable, so the only correct test is
-		// every prefix. Rare enough not to matter.
+		if p.tripleStar && n > 1 && dir {
+			// rsync: dir/*** matches the directory itself (but not a regular
+			// file with that name) and everything inside it. Match the whole
+			// subject against the pattern without the trailing *** so a
+			// leading ** may consume zero segments.
+			if matchSegsList(p.segments[:n-1], parts, p.anchored) {
+				return true
+			}
+		}
+		// A `**` makes the pattern length variable, so every prefix is tried.
+		// A trailing ** must consume at least one segment; matchSegments
+		// enforces that, so earlier ** segments may still match zero.
 		for k := 1; k <= limit; k++ {
 			if p.matchSegs(parts[:k]) {
 				return true
 			}
 		}
-		return false
-	}
-	n := len(p.segments)
-	if n == 0 {
 		return false
 	}
 	if p.anchored {
@@ -189,6 +219,19 @@ func (p Pattern) matchParts(parts []string, dir bool) bool {
 	// the subject, i.e. it is a contiguous window of exactly n segments.
 	for i := 0; i+n <= limit; i++ {
 		if matchSegments(p.segments, parts[i:i+n]) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchSegsList matches seg against parts, anchored or at any window.
+func matchSegsList(seg, parts []string, anchored bool) bool {
+	if anchored {
+		return matchSegments(seg, parts)
+	}
+	for i := 0; i < len(parts); i++ {
+		if matchSegments(seg, parts[i:]) {
 			return true
 		}
 	}
@@ -209,25 +252,66 @@ func (p Pattern) matchSegs(parts []string) bool {
 }
 
 func matchSegments(pat, path []string) bool {
-	if len(pat) == 0 {
-		return len(path) == 0
-	}
-	if pat[0] == "**" {
-		if matchSegments(pat[1:], path) {
-			return true
+	star := false
+	for i, p := range pat {
+		if p == "**" || (p == "***" && i == len(pat)-1) {
+			star = true
+			break
 		}
-		if len(path) > 0 {
-			return matchSegments(pat, path[1:])
+	}
+	if !star {
+		// No wildcard-with-arbitrary-length: no memo allocation needed. A
+		// non-trailing *** is an ordinary single-segment glob.
+		if len(pat) != len(path) {
+			return false
 		}
-		return false
+		for i := range pat {
+			if !matchOne(pat[i], path[i]) {
+				return false
+			}
+		}
+		return true
 	}
-	if len(path) == 0 {
-		return false
+	// Memoise (pattern index, path index). Without it, a pattern with several
+	// ** segments explores the same suffix combinations combinatorially for
+	// every event and every walk entry.
+	type state struct{ pi, si int }
+	memo := make(map[state]bool, len(pat)*2)
+	done := make(map[state]bool, len(pat)*2)
+	var m func(pi, si int) bool
+	m = func(pi, si int) bool {
+		st := state{pi, si}
+		if done[st] {
+			return memo[st]
+		}
+		done[st] = true
+		res := false
+		lastStar := pi == len(pat)-1 && (pat[pi] == "**" || pat[pi] == "***")
+		switch {
+		case pi == len(pat):
+			res = si == len(path)
+		case lastStar:
+			// A trailing ** (and ***) means "everything below": at least one
+			// segment. Earlier ** segments may still consume zero.
+			if si < len(path) {
+				if si+1 == len(path) {
+					res = true
+				} else {
+					res = m(pi, si+1)
+				}
+			}
+		case pat[pi] == "**":
+			res = m(pi+1, si)
+			if !res && si < len(path) {
+				res = m(pi, si+1)
+			}
+		case si < len(path) && matchOne(pat[pi], path[si]):
+			res = m(pi+1, si+1)
+		}
+		memo[st] = res
+		return res
 	}
-	if !matchOne(pat[0], path[0]) {
-		return false
-	}
-	return matchSegments(pat[1:], path[1:])
+	return m(0, 0)
 }
 
 // matchOne is a shell glob matcher for a single path segment.

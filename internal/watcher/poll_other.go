@@ -193,12 +193,15 @@ func (b *pollBackend) scan() {
 	// "rm -rf data && cp -a new data" that reads as "everything was deleted",
 	// which is the wrong mirror and the wrong log line.
 	var gone []string
+	var failed []string
 	b.mu.Lock()
 	for _, root := range roots {
 		_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
 			if err != nil {
 				if p == root {
 					gone = append(gone, root)
+				} else {
+					failed = append(failed, p)
 				}
 				return nil
 			}
@@ -211,10 +214,21 @@ func (b *pollBackend) scan() {
 				if !inFresh(seed, p) {
 					evs = append(evs, event.Event{Path: p, Op: event.Create, IsDir: isDir, At: now})
 				}
-			} else if !inFresh(seed, p) && !isDir {
-				if old.size != size || old.mtime != mtime {
+			} else if !inFresh(seed, p) {
+				// A type change has no separate event of its own: a file that
+				// became a directory must be reported as Create/Recreate, or
+				// the target keeps a file where a directory now belongs and
+				// every child copy fails with EEXIST.
+				switch {
+				case old.isDir != isDir:
+					evs = append(evs, event.Event{Path: p, Op: event.Create, IsDir: isDir, At: now})
+				case isDir:
+					if old.mode != mode {
+						evs = append(evs, event.Event{Path: p, Op: event.Attrib, IsDir: true, At: now})
+					}
+				case old.size != size || old.mtime != mtime:
 					evs = append(evs, event.Event{Path: p, Op: event.Write, At: now})
-				} else if old.mode != mode {
+				case old.mode != mode:
 					evs = append(evs, event.Event{Path: p, Op: event.Attrib, At: now})
 				}
 			}
@@ -226,8 +240,16 @@ func (b *pollBackend) scan() {
 		if st.gen == gen {
 			continue
 		}
-		if !inFresh(seed, p) {
+		if !inFresh(seed, p) && !underAny(gone, p) && !underAny(failed, p) {
 			evs = append(evs, event.Event{Path: p, Op: event.Delete, IsDir: st.isDir, At: now})
+		}
+		// A path under a root/subtree whose walk failed is not evidence of a
+		// deletion. Keep its record (marked current) so a transient EIO/EACCES
+		// or an unmounted share does not empty the target.
+		if underAny(gone, p) || underAny(failed, p) {
+			st.gen = gen
+			b.snap[p] = st
+			continue
 		}
 		delete(b.snap, p)
 	}
@@ -235,12 +257,14 @@ func (b *pollBackend) scan() {
 
 	// Delivery happens outside the lock: push blocks on the event channel when
 	// the engine is behind, and holding the snapshot mutex across that would
-	// stall every other operation.
-	for _, ev := range evs {
-		b.push(ev)
-	}
+	// stall every other operation. RootGone goes first: the deletes that used
+	// to precede it could be flushed as a real mirror before the engine knew
+	// the root was unreadable.
 	for _, root := range gone {
 		b.push(event.Event{Path: root, Op: event.RootGone, IsDir: true, At: now})
+	}
+	for _, ev := range evs {
+		b.push(ev)
 	}
 
 	// A scan that takes longer than the interval means the tree is too big for
@@ -252,6 +276,15 @@ func (b *pollBackend) scan() {
 		b.logf("watcher: one scan took %s, longer than the %s interval; raise watch_interval",
 			d.Round(time.Millisecond), b.interval)
 	}
+}
+
+func underAny(roots []string, p string) bool {
+	for _, r := range roots {
+		if IsUnder(r, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func inFresh(fresh map[string]bool, p string) bool {

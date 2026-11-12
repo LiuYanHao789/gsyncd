@@ -3,8 +3,10 @@
 package watcher
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -21,9 +23,10 @@ type inotifyBackend struct {
 	done chan struct{}
 	once sync.Once
 
-	mu      sync.RWMutex
-	wdToDir map[int32]string
-	dirToWd map[string]int32
+	mu       sync.RWMutex
+	wdToDir  map[int32]string
+	dirToWd  map[string]int32
+	dirIdent map[string]fileIdentity
 
 	// pending pairs MOVED_FROM events waiting for MOVED_TO, keyed by cookie.
 	pending map[uint32]pendingMove
@@ -33,6 +36,11 @@ type inotifyBackend struct {
 	// itself vanished", and only the latter has to be reported as RootGone:
 	// the first is an ordinary delete the engine already handles.
 	isRoot func(path string) bool
+
+	// lastLostOverflow throttles the non-root watch-loss notice: a bulk
+	// delete+recreate can retire thousands of watches, and one full resync is
+	// enough for all of them.
+	lastLostOverflow time.Time
 
 	logf func(format string, args ...any)
 }
@@ -85,12 +93,13 @@ func NewInotify(logf func(string, ...any)) (Backend, error) {
 		// backpressure on the kernel queue, and what the kernel cannot hold is
 		// dropped outright. Absorbing a burst here is far cheaper than the full
 		// resync an overflow triggers.
-		out:     make(chan event.Event, 32768),
-		done:    make(chan struct{}),
-		wdToDir: make(map[int32]string),
-		dirToWd: make(map[string]int32),
-		pending: make(map[uint32]pendingMove),
-		logf:    logf,
+		out:      make(chan event.Event, 32768),
+		done:     make(chan struct{}),
+		wdToDir:  make(map[int32]string),
+		dirToWd:  make(map[string]int32),
+		dirIdent: make(map[string]fileIdentity),
+		pending:  make(map[uint32]pendingMove),
+		logf:     logf,
 	}
 	go b.read()
 	return b, nil
@@ -141,8 +150,15 @@ func (b *inotifyBackend) Add(path string) error {
 // the kernel watches nothing. Every later change below that path is then
 // invisible until the next full resync, with no error and no log line.
 func (b *inotifyBackend) AddWatch(path string) (bool, error) {
+	ident, identErr := identityOf(path)
+	// Hold b.mu across the syscall and the map update. The kernel can recycle a
+	// wd between InotifyAddWatch and the map write; retireMovedSubtree holds
+	// the same lock while it re-checks and removes, so serialising here is what
+	// makes its invariant real.
+	b.mu.Lock()
 	wd, err := syscall.InotifyAddWatch(b.fd, path, inotifyMask)
 	if err != nil {
+		b.mu.Unlock()
 		if err == syscall.ENOSPC {
 			// The kernel watch table is full. Report it as a degradable
 			// condition so a huge tree keeps working instead of aborting
@@ -151,12 +167,22 @@ func (b *inotifyBackend) AddWatch(path string) (bool, error) {
 		}
 		return false, fmt.Errorf("inotify_add_watch %s: %w", path, err)
 	}
-	b.mu.Lock()
 	prev, known := b.dirToWd[path]
 	if known && prev == int32(wd) {
-		// Same inode, watch already in place: nothing new to scan.
-		b.mu.Unlock()
-		return false, nil
+		// The same wd number is not proof of the same inode: after a lost
+		// IN_IGNORED the kernel can hand the number to a recreated directory.
+		// Compare the recorded identity and treat a different inode as fresh,
+		// so its existing content is backfilled.
+		if identErr == nil {
+			if old, ok := b.dirIdent[path]; ok && old == ident {
+				b.mu.Unlock()
+				return false, nil
+			}
+		} else {
+			// Cannot prove it is new; avoid a needless rescan.
+			b.mu.Unlock()
+			return false, nil
+		}
 	}
 	if known {
 		// The recorded descriptor is a leftover from an inode that no longer
@@ -166,9 +192,15 @@ func (b *inotifyBackend) AddWatch(path string) (bool, error) {
 		if other, ok := b.wdToDir[prev]; !ok || other == path {
 			delete(b.wdToDir, prev)
 		}
+		delete(b.dirIdent, path)
 	}
 	b.wdToDir[int32(wd)] = path
 	b.dirToWd[path] = int32(wd)
+	if identErr == nil {
+		b.dirIdent[path] = ident
+	} else {
+		delete(b.dirIdent, path)
+	}
 	b.mu.Unlock()
 	return true, nil
 }
@@ -178,7 +210,14 @@ func (b *inotifyBackend) Remove(path string) error {
 	wd, ok := b.dirToWd[path]
 	if ok {
 		delete(b.dirToWd, path)
-		delete(b.wdToDir, wd)
+		delete(b.dirIdent, path)
+		// The wd may have been recycled for another directory; only remove the
+		// reverse mapping (and the kernel watch) when it still names this path.
+		if cur, found := b.wdToDir[wd]; found && cur == path {
+			delete(b.wdToDir, wd)
+		} else {
+			ok = false
+		}
 	}
 	b.mu.Unlock()
 	if !ok {
@@ -271,23 +310,63 @@ func (b *inotifyBackend) dispatch(ev *rawEvent, name string) {
 		// dead wd -> path entry for every directory ever deleted, which on a
 		// churning dataset is a slow leak (#686) and can also mislabel a later
 		// event that happens to get the recycled wd number.
-		dir, wasRoot := b.rootOf(ev.Wd)
-		b.mu.Lock()
-		if d, ok := b.wdToDir[ev.Wd]; ok {
-			delete(b.wdToDir, ev.Wd)
-			if cur, ok := b.dirToWd[d]; ok && cur == ev.Wd {
-				delete(b.dirToWd, d)
+		b.mu.RLock()
+		mapped, known := b.wdToDir[ev.Wd]
+		rec, hasRec := b.dirIdent[mapped]
+		isRootFn := b.isRoot
+		b.mu.RUnlock()
+		if !known {
+			return
+		}
+		isRoot := isRootFn != nil && isRootFn(mapped)
+		cleanup := func() {
+			b.mu.Lock()
+			if cur, ok := b.wdToDir[ev.Wd]; ok && cur == mapped {
+				delete(b.wdToDir, ev.Wd)
+				delete(b.dirIdent, mapped)
+				if w, ok := b.dirToWd[mapped]; ok && w == ev.Wd {
+					delete(b.dirToWd, mapped)
+				}
 			}
+			b.mu.Unlock()
 		}
-		b.mu.Unlock()
-		if wasRoot {
-			// A root that loses its watch is not one directory among many:
-			// every event below it is now invisible. Say so, or the whole
-			// tree goes dark with nothing in the log (the producer that
-			// does "rm -rf data && cp -a new data" hits this every time).
-			b.push(event.Event{Path: dir, Op: event.RootGone, IsDir: true, At: now})
+		ident, ierr := identityOf(mapped)
+		switch {
+		case ierr != nil:
+			// The directory is gone. For a root that is the only notice its
+			// own subtree will never produce; for a descendant the parent's
+			// Delete already describes it, and emitting Overflow per directory
+			// turned "rm -rf" into a resync storm.
+			cleanup()
+			if isRoot {
+				b.push(event.Event{Path: mapped, Op: event.RootGone, IsDir: true, At: now})
+			}
+			return
+		case hasRec && ident == rec:
+			// Same inode, still present. This is a queued IN_IGNORED whose wd
+			// was already reused for a recreated directory; deleting the live
+			// mapping would make the new watch silently invisible.
+			return
+		default:
+			// The path now names a different inode (replaced, or a nested
+			// mount unmounted). The watch that belonged to the old inode is
+			// gone while the subtree may still be expected at this path.
+			cleanup()
+			if isRoot {
+				b.push(event.Event{Path: mapped, Op: event.RootGone, IsDir: true, At: now})
+			} else {
+				b.mu.Lock()
+				notify := now.Sub(b.lastLostOverflow) >= time.Minute
+				if notify {
+					b.lastLostOverflow = now
+				}
+				b.mu.Unlock()
+				if notify {
+					b.push(event.Event{Op: event.Overflow, At: now})
+				}
+			}
+			return
 		}
-		return
 	}
 	if ev.Mask&syscall.IN_Q_OVERFLOW != 0 {
 		// Never dropped: an overflow means events were already lost, and the
@@ -309,7 +388,10 @@ func (b *inotifyBackend) dispatch(ev *rawEvent, name string) {
 	}
 	path := dir
 	if name != "" {
-		path = dir + string(os.PathSeparator) + name
+		// filepath.Join, not dir+"/"+name: for a root of "/" the latter
+		// produced "//name", which did not compare equal to the "/name" the
+		// initial walk recorded.
+		path = filepath.Join(dir, name)
 	}
 
 	var op event.Op
@@ -343,11 +425,18 @@ func (b *inotifyBackend) dispatch(ev *rawEvent, name string) {
 		path = dir
 		isSelf = true
 	case ev.Mask&syscall.IN_MOVE_SELF != 0:
-		// The watched directory itself was renamed. Its new name is reported
-		// by the parent's MOVED_FROM/MOVED_TO pair, which is the event that
-		// can be acted on; a bare MOVED_SELF has no destination in it, and
-		// turning it into a delete of the old path would remove the mirror of
-		// a directory that merely moved.
+		// The watched directory itself was renamed. For an ordinary
+		// subdirectory the parent's MOVED_FROM/MOVED_TO pair carries the new
+		// name. A sync root has no watched parent, so a root rename arrives
+		// only as MOVED_SELF; without reporting it the kernel watch follows
+		// the moved inode while paths keep the old prefix, and a later write
+		// under the moved tree deletes the target copy. Retire the stale
+		// watches and let the supervisor re-attach if the configured path
+		// reappears.
+		if d, wasRoot := b.rootOf(ev.Wd); wasRoot {
+			b.removeWatchesBelow(d)
+			b.push(event.Event{Path: d, Op: event.RootGone, IsDir: true, At: now})
+		}
 		return
 	case ev.Mask&syscall.IN_MOVED_FROM != 0:
 		// Hold it: a matching MOVED_TO may still arrive (issue #225).
@@ -436,6 +525,10 @@ func (b *inotifyBackend) dispatch(ev *rawEvent, name string) {
 // million watched directories: 1.15s and 122MB allocated per rename, holding
 // b.mu, so the event reader could not run at all for that long.
 func (b *inotifyBackend) Rekey(from, to string, moved []string) {
+	// Keep this under the lock and free of syscalls: the backend reader may
+	// dispatch events under the renamed directory while this runs, resolving
+	// their paths from wdToDir. Identity is unchanged by a rename, so the
+	// recorded value moves with the path.
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	for _, old := range moved {
@@ -448,8 +541,15 @@ func (b *inotifyBackend) Rekey(from, to string, moved []string) {
 			continue
 		}
 		delete(b.dirToWd, old)
+		oldID, hadID := b.dirIdent[old]
+		delete(b.dirIdent, old)
 		b.dirToWd[np] = wd
 		b.wdToDir[wd] = np
+		if hadID {
+			b.dirIdent[np] = oldID
+		} else {
+			delete(b.dirIdent, np)
+		}
 	}
 }
 
@@ -465,18 +565,122 @@ func (b *inotifyBackend) push(ev event.Event) {
 func (b *inotifyBackend) flushExpired() {
 	now := time.Now()
 	var dead []event.Event
+	var movedOut []string
+	var recreated []string
 	b.mu.Lock()
 	for c, p := range b.pending {
-		if now.Sub(p.when) >= MoveGrace {
-			ev := p.ev
-			ev.Op = event.Delete
+		if now.Sub(p.when) < MoveGrace {
+			continue
+		}
+		ev := p.ev
+		_, lerr := os.Lstat(ev.Path)
+		if lerr != nil && !errors.Is(lerr, os.ErrNotExist) && !errors.Is(lerr, syscall.ENOTDIR) {
+			// EACCES/EIO and friends: we cannot tell whether the name is gone.
+			// Keep the pending move and retry on the next tick rather than
+			// dropping it without any event.
+			continue
+		}
+		delete(b.pending, c)
+		if lerr == nil {
+			// The name was recreated inside the grace window. Tell the engine
+			// to replace the old target incarnation wholesale; a plain Delete
+			// would collapse the newer Create and drop the recreated subtree.
+			ev.Op = event.Delete | event.Create
+			ev.Recreate = true
+			ev.Subtree = ev.IsDir
 			dead = append(dead, ev)
-			delete(b.pending, c)
+			recreated = append(recreated, ev.Path)
+			continue
+		}
+		ev.Op = event.Delete
+		dead = append(dead, ev)
+		if p.ev.IsDir {
+			movedOut = append(movedOut, p.ev.Path)
 		}
 	}
 	b.mu.Unlock()
+	// inotify watches follow the inode. A directory moved out of the tree
+	// keeps its watches, and those stale paths would keep producing events for
+	// a directory the mirror no longer contains (and consume max_user_watches
+	// forever). Retire them now that the move is known to have left the tree.
+	for _, root := range movedOut {
+		b.removeWatchesBelow(root)
+	}
+	// A recreated name may still have the old inode's descendant watches; keep
+	// the new AddWatch mappings and retire only the stale ones.
+	for _, root := range recreated {
+		b.retireMovedSubtree(root)
+	}
 	for _, ev := range dead {
 		b.push(ev)
+	}
+}
+
+// retireMovedSubtree removes the watches of a moved-out directory's old
+// inodes while leaving those of a directory recreated at the same path.
+func (b *inotifyBackend) retireMovedSubtree(root string) {
+	type cand struct {
+		path string
+		wd   int32
+		id   fileIdentity
+		has  bool
+	}
+	b.mu.RLock()
+	cands := make([]cand, 0, 16)
+	for p, wd := range b.dirToWd {
+		if p == root || IsUnder(root, p) {
+			id, has := b.dirIdent[p]
+			cands = append(cands, cand{p, wd, id, has})
+		}
+	}
+	b.mu.RUnlock()
+	for _, c := range cands {
+		stale := false
+		if _, err := os.Lstat(c.path); err != nil {
+			stale = true
+		} else if id, err := identityOf(c.path); err == nil && c.has && id != c.id {
+			stale = true
+		}
+		if !stale {
+			continue
+		}
+		b.mu.Lock()
+		// Re-check identity as well as the wd: AddWatch may have re-registered
+		// this path (possibly with a recycled wd) between the snapshot and here.
+		if cur, ok := b.dirToWd[c.path]; ok && cur == c.wd {
+			id, has := b.dirIdent[c.path]
+			if has == c.has && (!c.has || id == c.id) {
+				delete(b.dirToWd, c.path)
+				delete(b.dirIdent, c.path)
+				if cur2, ok := b.wdToDir[c.wd]; ok && cur2 == c.path {
+					delete(b.wdToDir, c.wd)
+					// Remove while the lock is held so AddWatch cannot recycle
+					// this number before the syscall.
+					_, _ = syscall.InotifyRmWatch(b.fd, uint32(c.wd))
+				}
+			}
+		}
+		b.mu.Unlock()
+	}
+}
+
+// removeWatchesBelow retires every recorded watch at or below root.
+func (b *inotifyBackend) removeWatchesBelow(root string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for path, wd := range b.dirToWd {
+		if path == root || IsUnder(root, path) {
+			delete(b.dirToWd, path)
+			delete(b.dirIdent, path)
+			if cur, ok := b.wdToDir[wd]; ok && cur == path {
+				delete(b.wdToDir, wd)
+				// Remove under the lock so a concurrent AddWatch cannot recycle
+				// this wd before the syscall.
+				_, _ = syscall.InotifyRmWatch(b.fd, uint32(wd))
+			}
+			// A stale reverse mapping (wd recycled for another directory) is
+			// dropped above, but its live watch must not be removed.
+		}
 	}
 }
 
