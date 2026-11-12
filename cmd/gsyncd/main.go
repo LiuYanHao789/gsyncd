@@ -33,7 +33,7 @@ import (
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
-var version = "0.4.0"
+var version = "0.5.0"
 
 // envReloaded marks the process that replaced itself for a SIGHUP reload. It
 // must not daemonize again: it already has the right session and pid, and a

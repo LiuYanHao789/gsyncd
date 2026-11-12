@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -137,16 +138,16 @@ type Sync struct {
 	// Structured rsync options. They exist so the common flags do not have to
 	// be written as raw --flags, and so a typo is a configuration error rather
 	// than a flag rsync silently ignores. RSyncExtra remains the escape hatch.
-	RSyncBinary       string
-	RSyncBWLimit      int64
-	RSyncCompress     bool
-	RSyncXattrs       bool
-	RSyncACLs         bool
-	RSyncHardLinks    bool
-	RSyncChown        string
-	RSyncChmod        string
-	RSyncPasswordFile string
-	RSyncPath         string
+	RSyncBinary         string
+	RSyncBWLimit        int64
+	RSyncCompress       bool
+	RSyncXattrs         bool
+	RSyncACLs           bool
+	RSyncHardLinks      bool
+	RSyncChown          string
+	RSyncChmod          string
+	RSyncPasswordFile   string
+	RSyncPath           string
 	RSyncDeleteExcluded bool
 
 	// PreserveOwner controls uid/gid copying in the direct backend:
@@ -572,6 +573,14 @@ func applySync(t tomlTable) (Sync, error) {
 			return s, fmt.Errorf("unknown key %q", k)
 		}
 	}
+	// A key that belongs to another backend is almost always a mistake:
+	// before this check it was accepted and silently ignored, so a direct
+	// sync could carry rsync_xattrs or an rsync sync could carry
+	// preserve_xattrs without any hint that the option did nothing.
+	if err := checkModeKeys(s.Mode, t); err != nil {
+		return s, err
+	}
+
 	// rsyncssh is serial by default. The original lsyncd pinned it to one
 	// process for a reason: concurrent ssh moves and rsync uploads against the
 	// same destination can observe each other half-applied, and a failed move
@@ -592,6 +601,87 @@ func applySync(t tomlTable) (Sync, error) {
 		}
 	}
 	return s, nil
+}
+
+// Keys that only one backend reads. They are normalised with normKey, so the
+// underscore and case spellings all map to the same entry.
+var (
+	directOnlyKeys = map[string]bool{
+		"preserveowner":     true,
+		"preservemode":      true,
+		"preservexattrs":    true,
+		"preservehardlinks": true,
+		"sparse":            true,
+		"copyspecial":       true,
+		"workers":           true,
+		"prefetch":          true,
+		"checkpoint":        true,
+		"fsync":             true,
+		"verify":            true,
+		"verifyretries":     true,
+	}
+	rsyncOnlyKeys = map[string]bool{
+		"batchlimit":          true,
+		"remote":              true,
+		"rsyncextra":          true,
+		"rsyncopts":           true,
+		"rsyncbinary":         true,
+		"rsyncbwlimit":        true,
+		"rsynccompress":       true,
+		"rsyncxattrs":         true,
+		"rsyncacls":           true,
+		"rsynchardlinks":      true,
+		"rsyncchown":          true,
+		"rsyncchmod":          true,
+		"rsyncpasswordfile":   true,
+		"rsyncpath":           true,
+		"rsyncdeleteexcluded": true,
+	}
+	rsyncsshOnlyKeys = map[string]bool{
+		"targetdir": true,
+		"ssh":       true,
+	}
+)
+
+// checkModeKeys rejects a key that the selected backend does not read.
+//
+// Accepting it silently was the dangerous part: a direct sync with
+// rsync_xattrs, or an rsync sync with preserve_xattrs, looked configured but
+// the option never took effect. -check and startup both go through Parse, so
+// this is where the mistake becomes visible.
+//
+// Every offending key is reported, in a stable order, instead of only the first
+// one a map iteration happened to reach: an operator fixing a config wants the
+// whole list in one run.
+func checkModeKeys(mode Mode, t tomlTable) error {
+	keys := make([]string, 0, len(t))
+	for k := range t {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var problems []string
+	for _, k := range keys {
+		n := normKey(k)
+		switch {
+		case directOnlyKeys[n] && mode != ModeDirect:
+			problems = append(problems, fmt.Sprintf(
+				"%q is direct-only (current mode = %q); set mode = \"direct\" or remove it",
+				k, mode))
+		case rsyncOnlyKeys[n] && mode == ModeDirect:
+			problems = append(problems, fmt.Sprintf(
+				"%q requires mode = \"rsync\" or \"rsyncssh\" (current mode = %q)",
+				k, mode))
+		case rsyncsshOnlyKeys[n] && mode != ModeRsyncSSH:
+			problems = append(problems, fmt.Sprintf(
+				"%q requires mode = \"rsyncssh\" (current mode = %q)",
+				k, mode))
+		}
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("key not valid for mode %q: %s", mode, strings.Join(problems, "; "))
+	}
+	return nil
 }
 
 func applySSH(sh *SSH, t tomlTable) error {

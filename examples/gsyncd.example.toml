@@ -16,7 +16,7 @@
 #  本文件由内置 TOML 子集解析器读取，不支持完整 TOML：
 #    - 支持 [table]、[[table]]、[table.sub]、基本类型、字符串、数组（可跨行）
 #    - 不支持多行字符串（"""..."""）、日期字面量、表头之外的 dotted key
-#    - 未知键会直接报错退出（避免拼写错误静默失效）
+#    - 未知键、以及不属于当前 mode 的键都会直接报错退出（避免拼写错误静默失效）
 #
 #  时长：写字符串按 Go duration 解析（"500ms"/"15s"/"2m"/"1h"）；
 #        写纯数字按秒解释（delay = 15 等价于 delay = "15s"）。
@@ -87,7 +87,7 @@ target_guard = true
 #
 #  本场景使用 direct 键：preserve_* / workers / prefetch / checkpoint /
 #  fsync / verify / sparse / copy_special 等。
-#  rsync_* 与 [sync.ssh] 在 direct 下无效，不要混配。
+#  rsync_* 与 [sync.ssh] 在 direct 下不是合法参数，配置后会直接报错退出。
 # ============================================================================
 [[sync]]
 
@@ -175,9 +175,6 @@ prefetch = 0
 # 也可写绝对路径。记录只加速重启，损坏时自动退回全量核对。
 checkpoint = "auto"
 
-# rsync 后端单次调用的最大路径数。
-batch_limit = 10000
-
 # direct 模式每个文件 rename 前都 fsync。默认 false：大文件本来就会刷盘，
 # 百万小文件逐个 fsync 比拷贝还慢。
 fsync = false
@@ -200,7 +197,7 @@ max_processes = 0
 #
 #  本场景使用 rsyncssh 键：target_dir、[sync.ssh]、rsync_*。
 #  preserve_* / workers / prefetch / checkpoint / verify 等 direct 键
-#  在这里无效。
+#  在这里不是合法参数，配置后会直接报错退出。
 # [[sync]]
 # name = "data-remote"
 # mode = "rsyncssh"
@@ -226,7 +223,7 @@ max_processes = 0
 #
 #  本场景使用 rsync 键：batch_limit、remote、rsync_*。
 #  preserve_* / checkpoint / verify / workers / prefetch 等 direct 键
-#  在这里无效。
+#  在这里不是合法参数，配置后会直接报错退出。
 # [[sync]]
 # name = "data-rsync"
 # mode = "rsync"

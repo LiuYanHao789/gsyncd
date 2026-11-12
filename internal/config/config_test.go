@@ -208,6 +208,7 @@ func TestMultiLineArrays(t *testing.T) {
 nodaemon = true
 
 [[sync]]
+mode = "rsync"
 source = "/data/a"
 target = "/backup/a"
 exclude = [
@@ -305,7 +306,6 @@ delete   = "startup"
 excludes = ["*.tmp"]
 workers  = 4
 prefetch = 12
-batch_limit = 500
 fsync    = false
 checkpoint = "auto"
 
@@ -316,6 +316,7 @@ source     = "/srv/b"
 target     = "backup@host"
 target_dir = "/srv/b"
 rsync_extra = ["--numeric-ids"]
+batch_limit = 500
 
 [sync.ssh]
 port          = 2222
@@ -345,14 +346,14 @@ identity_file = "/root/.ssh/id_rsa"
 		t.Fatalf("syncs: %d", len(cfg.Syncs))
 	}
 	a := cfg.Syncs[0]
-	if a.BatchLimit != 500 || a.Workers != 4 || a.DeleteMode != "startup" || !a.Delete {
+	if a.Workers != 4 || a.DeleteMode != "startup" || !a.Delete {
 		t.Fatalf("sync0: %+v", a)
 	}
 	if a.Prefetch != 12 || a.Checkpoint != "auto" {
 		t.Fatalf("sync0 prefetch/checkpoint: prefetch=%d checkpoint=%q", a.Prefetch, a.Checkpoint)
 	}
 	b := cfg.Syncs[1]
-	if b.TargetDir != "/srv/b" || len(b.RSyncExtra) != 1 || b.SSH.Port != 2222 {
+	if b.TargetDir != "/srv/b" || len(b.RSyncExtra) != 1 || b.BatchLimit != 500 || b.SSH.Port != 2222 {
 		t.Fatalf("sync1: %+v", b)
 	}
 	if b.SSH.IdentityFile != "/root/.ssh/id_rsa" {
@@ -481,7 +482,7 @@ func TestCloseWriteRejectsDisabledMaxHold(t *testing.T) {
 // The fidelity and scheduling keys added for the lsyncd compatibility work
 // must round-trip, including the underscore spelling.
 func TestFidelityKeysParse(t *testing.T) {
-	const doc = `
+	const directDoc = `
 [[sync]]
 source = "/a"
 target = "/b"
@@ -495,19 +496,8 @@ sparse = true
 copy_special = true
 bandwidth_limit = "2m"
 full_resync = "6h"
-rsync_binary = "/opt/rsync"
-rsync_bwlimit = "50m"
-rsync_compress = true
-rsync_xattrs = true
-rsync_acls = true
-rsync_hard_links = true
-rsync_chown = "root:root"
-rsync_chmod = "D755,F644"
-rsync_password_file = "/etc/rsync.pass"
-rsync_path = "/usr/bin/rsync"
-rsync_delete_excluded = true
 `
-	cfg, err := Parse(doc)
+	cfg, err := Parse(directDoc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,13 +511,99 @@ rsync_delete_excluded = true
 	if s.BandwidthLimit != 2<<20 || s.FullResync != 6*time.Hour {
 		t.Fatalf("sizes: bw=%d full=%v", s.BandwidthLimit, s.FullResync)
 	}
-	if s.RSyncBinary != "/opt/rsync" || s.RSyncBWLimit != 50<<20 || !s.RSyncCompress ||
-		!s.RSyncXattrs || !s.RSyncACLs || !s.RSyncHardLinks || !s.RSyncDeleteExcluded {
-		t.Fatalf("rsync options: %+v", s)
+
+	const rsyncDoc = `
+[[sync]]
+mode = "rsync"
+source = "/a"
+target = "/b"
+rsync_binary = "/opt/rsync"
+rsync_bwlimit = "50m"
+rsync_compress = true
+rsync_xattrs = true
+rsync_acls = true
+rsync_hard_links = true
+rsync_chown = "root:root"
+rsync_chmod = "D755,F644"
+rsync_password_file = "/etc/rsync.pass"
+rsync_path = "/usr/bin/rsync"
+rsync_delete_excluded = true
+`
+	cfg, err = Parse(rsyncDoc)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if s.RSyncChown != "root:root" || s.RSyncChmod != "D755,F644" ||
-		s.RSyncPasswordFile != "/etc/rsync.pass" || s.RSyncPath != "/usr/bin/rsync" {
-		t.Fatalf("rsync strings: %+v", s)
+	r := cfg.Syncs[0]
+	if r.Mode != ModeRsync {
+		t.Fatalf("mode: %q", r.Mode)
+	}
+	if r.RSyncBinary != "/opt/rsync" || r.RSyncBWLimit != 50<<20 || !r.RSyncCompress ||
+		!r.RSyncXattrs || !r.RSyncACLs || !r.RSyncHardLinks || !r.RSyncDeleteExcluded {
+		t.Fatalf("rsync options: %+v", r)
+	}
+	if r.RSyncChown != "root:root" || r.RSyncChmod != "D755,F644" ||
+		r.RSyncPasswordFile != "/etc/rsync.pass" || r.RSyncPath != "/usr/bin/rsync" {
+		t.Fatalf("rsync strings: %+v", r)
+	}
+}
+
+// A key that belongs to another backend must be rejected by Parse, which is
+// what -check and startup use. Silently ignoring it looked configured but did
+// nothing.
+func TestModeSpecificKeysRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		doc  string
+		want string
+	}{
+		{
+			"direct with rsync key",
+			"[[sync]]\nsource='/a'\ntarget='/b'\nrsync_xattrs=true\n",
+			"rsync",
+		},
+		{
+			"rsync with direct key",
+			"[[sync]]\nmode='rsync'\nsource='/a'\ntarget='/b'\npreserve_xattrs=true\n",
+			"direct-only",
+		},
+		{
+			"direct with batch_limit",
+			"[[sync]]\nsource='/a'\ntarget='/b'\nbatch_limit=10\n",
+			"rsync",
+		},
+		{
+			"rsync with target_dir",
+			"[[sync]]\nmode='rsync'\nsource='/a'\ntarget='/b'\ntarget_dir='/c'\n",
+			"rsyncssh",
+		},
+		{
+			"direct with ssh table",
+			"[[sync]]\nsource='/a'\ntarget='/b'\n[sync.ssh]\nport=22\n",
+			"rsyncssh",
+		},
+	}
+	for _, c := range cases {
+		_, err := Parse(c.doc)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: want error containing %q, got %v", c.name, c.want, err)
+		}
+	}
+
+	// Every offending key is reported, not just the first one the map
+	// iteration reached, so one -check run tells the operator everything to fix.
+	_, err := Parse("[[sync]]\nsource='/a'\ntarget='/b'\nrsync_xattrs=true\nbatch_limit=10\ntarget_dir='/c'\n")
+	if err == nil {
+		t.Fatal("expected multiple mode mismatches to be rejected")
+	}
+	for _, want := range []string{"rsync_xattrs", "batch_limit", "target_dir", `mode "direct"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("aggregated error %q does not mention %q", err, want)
+		}
+	}
+
+	// The matching backend must accept them.
+	if _, err := Parse("[[sync]]\nmode='rsyncssh'\nsource='/a'\ntarget='host'\ntarget_dir='/b'\nrsync_xattrs=true\n[sync.ssh]\nport=22\n"); err != nil {
+		t.Fatalf("valid rsyncssh config rejected: %v", err)
 	}
 }
 

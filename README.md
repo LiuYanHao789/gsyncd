@@ -4,7 +4,7 @@
 
 ```
 $ gsyncd -version
-gsyncd 0.4.0 (1.23.9)
+gsyncd 0.5.0 (1.23.5)
 ```
 
 ## 特性
@@ -64,7 +64,7 @@ gsyncd -status /var/lib/gsyncd/status.json
 | `-nodaemon` | 前台运行 |
 | `-once` | 只做初始全量同步后退出 |
 | `-status PATH` | 打印状态文件并退出 |
-| `-check` | 校验配置、源目录和目标守卫后退出 |
+| `-check` | 校验配置（含不属于当前 `mode` 的键）、源目录和目标守卫后退出，不启动同步 |
 | `-init-target` | 向每个本地目标写入 `.gsyncd-target` marker 后退出；目标必须已存在 |
 | `-verify-tree` | 只读对比源/目标目录树和文件集合；有差异时退出码非 0 |
 | `-verify-content` | 对比源/目标文件的 SHA-256、大小、mtime；有差异时退出码非 0 |
@@ -131,7 +131,7 @@ gsyncd -status /var/lib/gsyncd/status.json
 
 #### `direct` 专用参数
 
-以下键只在 `mode = "direct"` 下生效；配在 `rsync`/`rsyncssh` 下会被忽略。
+以下键只在 `mode = "direct"` 下生效；配在 `rsync`/`rsyncssh` 下会在解析配置时直接报错，进程不会启动（`-check` 退出码非 0）。
 
 | 键 | 默认 | 说明 |
 |---|---|---|
@@ -150,7 +150,7 @@ gsyncd -status /var/lib/gsyncd/status.json
 
 #### `rsync` / `rsyncssh` 专用参数
 
-以下键只在 `mode = "rsync"` 或 `"rsyncssh"` 下生效；配在 `direct` 下会被忽略。
+以下键只在 `mode = "rsync"` 或 `"rsyncssh"` 下生效；配在 `direct` 下会在解析配置时直接报错，进程不会启动。
 
 | 键 | 默认 | 说明 |
 |---|---|---|
@@ -179,7 +179,7 @@ gsyncd -status /var/lib/gsyncd/status.json
 
 `[sync.ssh]` 支持 `binary`、`port`、`identity_file`、`options`，仅 `rsyncssh` 使用。
 
-> 注意：当前版本中，把某个后端专用的键写到另一个后端**不会报错，只会被忽略**。例如 `direct` 配 `rsync_xattrs`、或 `rsync` 配 `preserve_xattrs`，都不会生效。请按上面的分组配置，避免“看起来配了、实际没生效”。
+> 模式不匹配的键会被拒绝：`direct` 配 `rsync_xattrs`、`rsync` 配 `preserve_xattrs`、非 `rsyncssh` 配 `target_dir` 等，都会在解析配置时列出全部非法键、当前模式以及要求的模式并退出，不会被静默忽略。部署前先跑 `gsyncd -config ... -check`，它只校验配置和目标，不启动同步。
 
 ### 常见组合
 
