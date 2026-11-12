@@ -84,6 +84,10 @@ target_guard = true
 
 # ============================================================================
 #  场景 A：本地/NFS 挂载点直接镜像（生效示例）
+#
+#  本场景使用 direct 键：preserve_* / workers / prefetch / checkpoint /
+#  fsync / verify / sparse / copy_special 等。
+#  rsync_* 与 [sync.ssh] 在 direct 下无效，不要混配。
 # ============================================================================
 [[sync]]
 
@@ -193,6 +197,10 @@ max_processes = 0
 # ============================================================================
 
 # 场景 B：rsync over ssh
+#
+#  本场景使用 rsyncssh 键：target_dir、[sync.ssh]、rsync_*。
+#  preserve_* / workers / prefetch / checkpoint / verify 等 direct 键
+#  在这里无效。
 # [[sync]]
 # name = "data-remote"
 # mode = "rsyncssh"
@@ -215,6 +223,10 @@ max_processes = 0
 # ServerAliveCountMax = "3"
 
 # 场景 C：本机 rsync（目标也可以是已挂载的 NFS 路径）
+#
+#  本场景使用 rsync 键：batch_limit、remote、rsync_*。
+#  preserve_* / checkpoint / verify / workers / prefetch 等 direct 键
+#  在这里无效。
 # [[sync]]
 # name = "data-rsync"
 # mode = "rsync"

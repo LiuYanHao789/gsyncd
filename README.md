@@ -99,15 +99,16 @@ gsyncd -status /var/lib/gsyncd/status.json
 | `io_prio` | `""` | `idle` / `best-effort` / `realtime`，可带级别 |
 | `target_guard` | `true` | 目标必须已存在且在非 `/` 挂载点或带 marker；否则拒绝启动 |
 
-### `[[sync]]`
+全局键对所有 `[[sync]]` 生效；`target_guard` 对远端目标（`rsync` 的 `host:path`、`rsyncssh`）自动跳过。
+
+### `[[sync]]` 通用参数（`direct` / `rsync` / `rsyncssh` 都生效）
 
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `name` | 源目录 basename | 日志/状态标识 |
 | `source` | — | 被监视的本地目录 |
-| `target` | — | 目标目录；`rsyncssh` 下为目标主机 |
-| `target_dir` | 源目录绝对路径 | 仅 `rsyncssh`：远端目标目录 |
 | `mode` | `direct` | `direct` \| `rsync` \| `rsyncssh` |
+| `target` | — | 目标写法随 `mode` 变化，见下方“目标写法” |
 | `delay` | `15s` | 事件静默多久后传输 |
 | `delay_mode` | `"quiet"` | `"quiet"` 整树静默后刷；`"deadline"` 最早事件满 delay 即刷（lsyncd 语义） |
 | `max_hold` | `15m` | 持续写入时最多等多久强制刷新；负值关闭 |
@@ -115,31 +116,76 @@ gsyncd -status /var/lib/gsyncd/status.json
 | `delete` | `true` | `true`/`false`/`"startup"`/`"running"` |
 | `excludes` | `[]` | rsync 风格排除模式 |
 | `exclude_from` | `[]` | 排除规则文件（相对配置文件目录），文件规则在前、内联规则在后 |
+| `symlink_mode` | `"safe"` | `"safe"` 仅根内链接；`"all"` 原样复制；`"skip"`；三种后端都支持 |
+| `bandwidth_limit` | `0` | direct 复制限速（字节/秒）；rsync/rsyncssh 在未设置 `rsync_bwlimit` 时作为回退 |
+| `full_resync` | `0` | 本 sync 的周期全量；0 继承全局 |
+| `max_processes` | 0（用全局） | 该 sync 的并发上限 |
+
+#### 目标写法
+
+| `mode` | `target` | `target_dir` |
+|---|---|---|
+| `direct` | 本地目录或已挂载的 NFS 路径 | 不使用 |
+| `rsync` | 本地目录，或 `host:path` / `host::module` / `rsync://...` | 不使用 |
+| `rsyncssh` | 远端主机（可写 `user@host`） | 远端目标目录 |
+
+#### `direct` 专用参数
+
+以下键只在 `mode = "direct"` 下生效；配在 `rsync`/`rsyncssh` 下会被忽略。
+
+| 键 | 默认 | 说明 |
+|---|---|---|
 | `preserve_mode` | `"full"` | `"full"` 保留 setuid/setgid/sticky；`"basic"` 仅 0777 |
 | `preserve_owner` | `"auto"` | `"auto"` 仅 root 时 chown；`true`/`false` |
-| `symlink_mode` | `"safe"` | `"safe"` 仅根内链接；`"all"` 原样复制；`"skip"` |
 | `preserve_xattrs` | `false` | Linux xattr（含 POSIX ACL），尽力而为 |
 | `preserve_hardlinks` | `false` | 单次初始扫描内重建硬链接 |
 | `sparse` | `false` | Linux 稀疏文件 |
 | `copy_special` | `false` | Linux FIFO/设备节点（设备节点需要 root） |
-| `bandwidth_limit` | `0` | direct 复制限速（字节/秒）；`rsync_*` 用 `rsync_bwlimit` |
-| `full_resync` | `0` | 本 sync 的周期全量；0 继承全局 |
-| `remote` | 自动推断 | 强制把含冒号的目标按 rsync 远端处理（覆盖自动推断） |
-| `rsync_extra` | `[]` | 追加给 rsync 的参数（`rsyncopts` 是兼容别名） |
-| `rsync_binary` / `rsync_bwlimit` / `rsync_compress` | — | 结构化 rsync 选项；见示例配置 |
-| `rsync_xattrs` / `rsync_acls` / `rsync_hard_links` | `false` | rsync 元数据保真 |
-| `rsync_chown` / `rsync_chmod` / `rsync_password_file` / `rsync_path` | — | rsync 透传选项 |
-| `rsync_delete_excluded` | `false` | 全量传输时同时删除被排除的目标项 |
-| `max_processes` | 0（用全局） | 该 sync 的并发上限 |
-| `workers` | `min(CPU,16)` | direct 并行拷贝 goroutine 数 |
-| `prefetch` | `min(CPU,16)` | direct 初始遍历预读目录的 goroutine 数 |
-| `checkpoint` | `""` | direct 断点续扫记录文件；`"auto"` 自动选目录 |
-| `batch_limit` | `10000` | 单次 rsync 最大路径数 |
-| `fsync` | `false` | direct 每个文件 rename 前 fsync |
-| `verify` | `true` | direct 传输时 SHA-256 校验 |
+| `workers` | `min(CPU,16)` | 并行拷贝 goroutine 数 |
+| `prefetch` | `min(CPU,16)` | 初始遍历预读目录的 goroutine 数 |
+| `checkpoint` | `""` | 断点续扫记录文件；`"auto"` 自动选目录 |
+| `fsync` | `false` | 每个文件 rename 前 fsync |
+| `verify` | `true` | 传输时 SHA-256 校验 |
 | `verify_retries` | `2` | 校验失败后的额外重拷次数 |
 
-`[sync.ssh]` 支持 `binary`、`port`、`identity_file`、`options`。支持 snake_case 和 camelCase；未知键会报错。
+#### `rsync` / `rsyncssh` 专用参数
+
+以下键只在 `mode = "rsync"` 或 `"rsyncssh"` 下生效；配在 `direct` 下会被忽略。
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `batch_limit` | `10000` | 单次 rsync 调用的最大路径数 |
+| `remote` | 自动推断 | 强制把含冒号的目标按 rsync 远端处理（可设 `false` 强制本地） |
+| `rsync_extra` | `[]` | 追加给 rsync 的参数（`rsyncopts` 是兼容别名） |
+| `rsync_binary` | `rsync` | 本机 rsync 可执行文件路径 |
+| `rsync_bwlimit` | — | rsync 限速（字节/秒；内部换算为 KiB/s） |
+| `rsync_compress` | `false` | `--compress` / `-z` |
+| `rsync_xattrs` | `false` | `--xattrs` / `-X` |
+| `rsync_acls` | `false` | `--acls` / `-A` |
+| `rsync_hard_links` | `false` | `--hard-links` / `-H` |
+| `rsync_chown` | — | `--chown=用户:组`，强制目标属主 |
+| `rsync_chmod` | — | `--chmod=D755,F644`，按规则调整权限 |
+| `rsync_password_file` | — | `--password-file`，rsync daemon/模块认证 |
+| `rsync_path` | — | `--rsync-path`，远端 rsync 路径 |
+| `rsync_delete_excluded` | `false` | 全量启动时同时删除被排除的目标项 |
+
+`rsync_*` 是 **rsync 自身的参数**，gsyncd 只负责翻译并传给 rsync；`direct` 的保真用 `preserve_*`，两者不要混用。
+
+#### `rsyncssh` 专用
+
+| 键 | 说明 |
+|---|---|
+| `target_dir` | 远端目标目录，默认等于源目录绝对路径 |
+
+`[sync.ssh]` 支持 `binary`、`port`、`identity_file`、`options`，仅 `rsyncssh` 使用。
+
+> 注意：当前版本中，把某个后端专用的键写到另一个后端**不会报错，只会被忽略**。例如 `direct` 配 `rsync_xattrs`、或 `rsync` 配 `preserve_xattrs`，都不会生效。请按上面的分组配置，避免“看起来配了、实际没生效”。
+
+### 常见组合
+
+- **只想复刻 `rsync -avz`**：`mode="rsync"`、`delete=false`、`rsync_compress=true`；`-a` 已内置，`-v` 不需要。需要保留外部符号链接时加 `symlink_mode="all"`。
+- **本地/NFS 备份**：`mode="direct"` 默认即可；需要硬链接/xattr/ACL/稀疏/设备节点时再开 `preserve_*` / `sparse` / `copy_special`。
+- **rsyncssh 远程镜像**：`mode="rsyncssh"`，`target` 写主机，`target_dir` 写远端目录；需要远端 move/delete 优化时保持 `delete=true`。
 
 ## 校验
 
