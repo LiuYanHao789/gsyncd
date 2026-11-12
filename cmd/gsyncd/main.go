@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
@@ -33,7 +34,7 @@ import (
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
-var version = "0.5.0"
+var version = "0.5.1"
 
 // envReloaded marks the process that replaced itself for a SIGHUP reload. It
 // must not daemonize again: it already has the right session and pid, and a
@@ -288,8 +289,21 @@ func run() error {
 			DelayMode:      s.DelayMode,
 			FullResync:     s.FullResync,
 		})
+		dest := s.Target
+		relativeDir := false
+		if s.Mode == config.ModeRsyncSSH {
+			// Print the resolved remote directory: an omitted target_dir is
+			// silently defaulted to the source's absolute path, and the
+			// destination is otherwise invisible in the startup log.
+			dest = s.Target + ":" + s.TargetDir
+			relativeDir = !path.IsAbs(s.TargetDir)
+		}
 		logger.Infof("[%s] mode=%s %s -> %s delay=%s delete=%v close_write=%v",
-			s.Name, s.Mode, s.Source, s.Target, s.Delay, s.Delete, s.CloseWrite)
+			s.Name, s.Mode, s.Source, dest, s.Delay, s.Delete, s.CloseWrite)
+		if relativeDir {
+			logger.Warnf("[%s] target_dir %q is not absolute; the remote rsync resolves it relative to the remote login directory",
+				s.Name, s.TargetDir)
+		}
 	}
 
 	eng, err := engine.New(specs, engine.Options{

@@ -730,6 +730,14 @@ func (s *Sync) Validate(base string) error {
 		if s.Target == "" {
 			return errors.New("target (host) is required for rsyncssh")
 		}
+		// target and target_dir are concatenated into the rsync destination as
+		// "target:target_dir", while remote move/delete scripts are sent to
+		// "target" and use target_dir directly. A path or host:path in target
+		// therefore makes the transfer and the remote operations disagree,
+		// which can move or delete the wrong tree on the remote host.
+		if err := validateRSyncSSHHost(s.Target); err != nil {
+			return err
+		}
 		if s.TargetDir == "" {
 			s.TargetDir = s.Source
 		}
@@ -875,6 +883,27 @@ func IsRemoteTarget(target string) bool {
 		}
 	}
 	return true
+}
+
+// validateRSyncSSHHost rejects a target that is not a bare host.
+//
+// rsyncssh means "run rsync over ssh against this host"; the remote directory
+// is always target_dir. The backend builds "target:target_dir" for the transfer
+// and sends move/delete scripts through ssh to target, so a path or host:path
+// in target makes those two operations disagree about where the data is.
+func validateRSyncSSHHost(target string) error {
+	// A host (or user@host) contains no path separators, no colon (that is
+	// host:path, rsync:// or an IPv6 literal) and no whitespace. Requiring an
+	// ssh alias for IPv6 keeps the "host:dir" concatenation unambiguous. A
+	// leading dash is rejected too: the value becomes an ssh/rsync operand,
+	// where "-o..." would be read as an option instead of a host.
+	if strings.HasPrefix(target, "-") ||
+		strings.ContainsAny(target, `/\:`) || strings.ContainsAny(target, " \t\r\n") {
+		return fmt.Errorf(
+			"rsyncssh target %q must be a bare host or user@host; put the remote directory in target_dir",
+			target)
+	}
+	return nil
 }
 
 // within reports whether p is at or below root.

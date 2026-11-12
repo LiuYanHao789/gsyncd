@@ -4,7 +4,7 @@
 
 ```
 $ gsyncd -version
-gsyncd 0.5.0 (1.23.5)
+gsyncd 0.5.1 (1.23.5)
 ```
 
 ## 特性
@@ -127,7 +127,7 @@ gsyncd -status /var/lib/gsyncd/status.json
 |---|---|---|
 | `direct` | 本地目录或已挂载的 NFS 路径 | 不使用 |
 | `rsync` | 本地目录，或 `host:path` / `host::module` / `rsync://...` | 不使用 |
-| `rsyncssh` | 远端主机（可写 `user@host`） | 远端目标目录 |
+| `rsyncssh` | 远端主机（仅 `host` 或 `user@host`，不能含路径或冒号） | 远端目标目录 |
 
 #### `direct` 专用参数
 
@@ -175,7 +175,11 @@ gsyncd -status /var/lib/gsyncd/status.json
 
 | 键 | 说明 |
 |---|---|
-| `target_dir` | 远端目标目录，默认等于源目录绝对路径 |
+| `target_dir` | 远端目标目录；省略时默认等于源目录绝对路径，启动日志会打印补全后的实际值 |
+
+`target` 只接受主机名或 `user@host`。把它写成 `host:path`、本地目录、`rsync://...`、`host::module` 或裸 IPv6 字面量（含冒号）都会在 `-check`/启动时报错：传输目标由 `target:target_dir` 拼接，而远端 move/delete 直接使用 `target_dir`，路径混写会让两者指向不同位置，可能操作远端错误目录。远端路径统一写 `target_dir`；需要 IPv6 时在 `~/.ssh/config` 里起别名，`target` 写别名。
+
+显式写的相对 `target_dir` 合法，rsync 会相对远端登录目录解析，启动时记一条 warn；建议使用绝对路径。
 
 `[sync.ssh]` 支持 `binary`、`port`、`identity_file`、`options`，仅 `rsyncssh` 使用。
 

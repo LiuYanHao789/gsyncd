@@ -1,7 +1,7 @@
 # gsyncd - convenience targets. Go 1.23+ on PATH (see go.mod).
 
 BIN     := gsyncd
-VERSION := 0.5.0
+VERSION := 0.5.1
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
 .PHONY: all build test vet fmt e2e smoke dist clean

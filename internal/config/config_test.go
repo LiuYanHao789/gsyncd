@@ -174,6 +174,53 @@ func TestValidateRejectsOverlappingPaths(t *testing.T) {
 	}
 }
 
+// rsyncssh's target is a host, not a path or host:path. The backend builds
+// "target:target_dir" for the transfer but sends move/delete scripts to target
+// and uses target_dir alone, so a path in target makes the two disagree about
+// where the data lives.
+func TestValidateRSyncSSHTargetShape(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bad := []string{
+		"/backup/data",
+		`C:\backup\data`,
+		"backup@10.0.0.9:/backup/data",
+		"host:path",
+		"host::module",
+		"rsync://host/module",
+		"[2001:db8::1]",
+		"host name",
+		"-oProxyCommand=id",
+	}
+	for _, target := range bad {
+		s := Sync{Name: "x", Source: src, Target: target, TargetDir: "/backup/data", Mode: ModeRsyncSSH}
+		err := s.Validate(root)
+		if err == nil || !strings.Contains(err.Error(), "bare host") {
+			t.Errorf("target %q: want host-shape error, got %v", target, err)
+		}
+	}
+	for _, target := range []string{"backup@10.0.0.9", "host", "backup-alias"} {
+		s := Sync{Name: "x", Source: src, Target: target, Mode: ModeRsyncSSH}
+		if err := s.Validate(root); err != nil {
+			t.Errorf("valid target %q rejected: %v", target, err)
+		}
+		// An omitted target_dir still defaults to the source's absolute path;
+		// startup logs the resolved value.
+		if s.TargetDir != src {
+			t.Errorf("default target_dir for %q = %q, want source %q", target, s.TargetDir, src)
+		}
+	}
+	// A relative target_dir is legal; rsync resolves it against the remote
+	// login directory, and startup warns about it.
+	s := Sync{Name: "x", Source: src, Target: "backup@host", TargetDir: "backup/data", Mode: ModeRsyncSSH}
+	if err := s.Validate(root); err != nil {
+		t.Fatalf("relative target_dir rejected: %v", err)
+	}
+}
+
 func TestParseRejectsUnknownKey(t *testing.T) {
 	_, err := Parse("[global]\nbogus = 1\n[[sync]]\nsource='/a'\ntarget='/b'\n")
 	if err == nil || !strings.Contains(err.Error(), "unknown key") {
